@@ -1,0 +1,24 @@
+# camera_config.yaml
+
+camera:
+  name: "sim_camera_01"
+
+  # --- Image Sensor ---
+  resolution:
+    width: 1920
+    height: 1080
+
+  # --- Intrinsics (pinhole model) ---
+  intrinsics:
+    # Using example values found online for now, will replace with real values later
+    focal_length:
+      fx: 912.36  # pixels — horizontal focal length
+      fy: 910.26  # pixels — vertical focal length (equal to fx for square pixels)
+    principal_point:
+      cx: 960.0   # pixels — typically width / 2
+      cy: 540.0   # pixels — typically height / 2
+
+  # --- Clip Planes ---
+  clip:
+    near: 0.0   # meters — points closer than this are culled
+    far: 1.0  # meters — points farther than this are culled
