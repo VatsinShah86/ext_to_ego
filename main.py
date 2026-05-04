@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
+from scipy.spatial import cKDTree
 
 def create_example_pc(density: float = 10):
     """
@@ -15,7 +16,7 @@ def create_example_pc(density: float = 10):
     if density <= 0:
         raise ValueError("density must be positive")
 
-    ground_size_mm = 10.0
+    ground_size_mm = 1
     step_mm = 1.0 / density
     half_size_mm = ground_size_mm * 0.5
 
@@ -181,6 +182,9 @@ def load_camera_config(path: str) -> dict:
     hfov = np.degrees(2 * np.arctan(W / (2 * fx)))
     vfov = np.degrees(2 * np.arctan(H / (2 * fy)))
 
+    cx = cfg["intrinsics"]["principal_point"]["cx"]
+    cy = cfg["intrinsics"]["principal_point"]["cy"]
+
     return {
         "name":    cfg["name"],
         "width":   W,
@@ -189,6 +193,10 @@ def load_camera_config(path: str) -> dict:
         "vfov":    vfov,
         "z_near":  clip["near"],
         "z_far":   clip["far"],
+        "fx":      fx,
+        "fy":      fy,
+        "cx":      cx,
+        "cy":      cy,
     }
 
 def transform_points_to_camera_frame(points_world: np.ndarray, T_cw: np.ndarray) -> np.ndarray:
@@ -278,6 +286,85 @@ def make_T_cw(R: np.ndarray, camera_pos_world: np.ndarray) -> np.ndarray:
     T[:3,  3] = t
     return T
 
+def depth_buffer_occlusion(
+    points_cam: np.ndarray,
+    fx: float, fy: float,
+    cx: float, cy: float,
+    width: int, height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Cull occluded points using depth buffer rasterization.
+    Must be called on points already in camera frame and inside the frustum.
+
+    Args:
+        points_cam: (N, 3) points in camera frame, already frustum-culled.
+        fx, fy:     Focal lengths in pixels.
+        cx, cy:     Principal point in pixels.
+        width:      Image width in pixels.
+        height:     Image height in pixels.
+
+    Returns:
+        visible_points: (M, 3) subset of points_cam that are not occluded.
+        mask:           (N,) boolean array — True where a point is visible.
+    """
+    x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
+
+    # --- Project to pixel coordinates ---
+    u = (fx * x / z + cx).astype(int)
+    v = (fy * y / z + cy).astype(int)
+
+    # --- Clip to image bounds (sanity check — frustum cull should already ensure this) ---
+    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    u = u[in_bounds]
+    v = v[in_bounds]
+    z = z[in_bounds]
+    original_indices = np.where(in_bounds)[0]
+
+    # --- Build depth buffer ---
+    depth_buffer = np.full((height, width), np.inf)
+    np.minimum.at(depth_buffer, (v, u), z)  # for each pixel, store minimum z
+
+    # --- A point is visible if its z matches the depth buffer at its pixel ---
+    z_at_pixel = depth_buffer[v, u]
+    visible_local = np.isclose(z, z_at_pixel)
+
+    # --- Map back to original indexing ---
+    mask = np.zeros(len(points_cam), dtype=bool)
+    mask[original_indices[visible_local]] = True
+
+    return points_cam[mask], mask
+
+
+def depth_buffer_occlusion_2(points_cam, fx, fy, cx, cy, width, height, pixel_radius=12.5):
+    x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
+
+    # Project to image plane
+    u = fx * x / z + cx
+    v = fy * y / z + cy
+
+    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    u = u[in_bounds]
+    v = v[in_bounds]
+    z_in = z[in_bounds]
+    original_indices = np.where(in_bounds)[0]
+
+    # Build KD-tree in projected (u, v) space
+    uv = np.stack([u, v], axis=1)  # (N, 2)
+    tree = cKDTree(uv)
+
+    # For each point, find all neighbors within pixel_radius pixels
+    # A point is occluded if any neighbor is closer in z
+    mask_local = np.ones(len(u), dtype=bool)
+    for i, (ui, vi, zi) in enumerate(zip(u, v, z_in)):
+        neighbor_idxs = tree.query_ball_point([ui, vi], r=pixel_radius)
+        neighbor_z = z_in[neighbor_idxs]
+        if np.any(neighbor_z < zi - 1e-3):  # any strictly closer neighbor?
+            mask_local[i] = False
+
+    mask = np.zeros(len(points_cam), dtype=bool)
+    mask[original_indices[mask_local]] = True
+    return points_cam[mask], mask
+
 def main():
     """
     Run the example point-cloud and camera-config workflow.
@@ -289,10 +376,11 @@ def main():
         None.
     """
     print("Hello from ext-to-ego!")
-    pc = create_example_pc(100)
-    pc = np.append(pc,create_box_pc(np.array([0, 0.2, 0.2]), 0.1, 0.1, 0.1, 50), axis = 0)
+    pc_density = 1000
+    pc = create_example_pc(pc_density)
+    pc = np.append(pc,create_box_pc(np.array([0, 0.2, 0.2]), 0.1, 0.1, 0.1, pc_density), axis = 0)
     print(pc.shape)
-    plot_pc(pc)
+    # plot_pc(pc)
 
     # Load Camera Intrinsics
     cam = load_camera_config("config/camera.yaml")
@@ -303,7 +391,7 @@ def main():
 
     # Transform points from initial frame to sim_camera frame
     pts_cam = transform_points_to_camera_frame(pc, T_cw)
-    plot_pc(pts_cam)
+    # plot_pc(pts_cam)
 
     # Build frustum
     frustum = build_frustum(cam['hfov'], cam['vfov'], cam['z_near'], cam['z_far'])
@@ -312,6 +400,28 @@ def main():
     pts_cam_filtered, mask = filter_points_in_frustum(pts_cam, frustum)
 
     # Plot out new ground
-    plot_pc(pts_cam_filtered)
+    # plot_pc(pts_cam_filtered)
+
+    # Occlusion culling
+    final_cam, occlusion_mask = depth_buffer_occlusion(
+        pts_cam_filtered,
+        fx=cam["fx"], fy=cam["fy"],
+        cx=cam["cx"], cy=cam["cy"],
+        width=cam["width"], height=cam["height"],
+    )
+
+    # Plot final
+    plot_pc(final_cam)
+
+    # Occlusion culling
+    final_cam_2, occlusion_mask_2 = depth_buffer_occlusion_2(
+        pts_cam_filtered,
+        fx=cam["fx"], fy=cam["fy"],
+        cx=cam["cx"], cy=cam["cy"],
+        width=cam["width"], height=cam["height"],
+    )
+
+    plot_pc(final_cam_2)
+
 if __name__ == "__main__":
     main()
