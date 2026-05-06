@@ -1,6 +1,7 @@
 import os
 import cv2
 import numpy as np
+import zarr
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import time
@@ -14,11 +15,25 @@ class RGBDData:
         self.depth_scale: float = float(meta["depth_scale"])
         self.timestamps: np.ndarray = meta["timestamps"]
         self.recording_time: str = str(meta["recording_time"])
-        self.intrinsics: dict = meta["intrinsics"].item()  # fx, fy, ppx, ppy, width, height
+        
+        # Load depth and color intrinsics from updated metadata
+        self.depth_intrinsics: dict = meta["depth_intrinsics"].item()  # fx, fy, ppx, ppy, width, height, etc.
+        self.color_intrinsics: dict = meta["color_intrinsics"].item()
+        
+        # For backward compatibility with code that uses self.intrinsics, use depth_intrinsics
+        self.intrinsics: dict = self.depth_intrinsics
+        
         print(f"depth_scale: {self.depth_scale}")
-        print(f"intrinsics: {self.intrinsics}")
-        self.color_frames: np.ndarray = np.load(os.path.join(folder, "color_raw.npy"))[..., ::-1]
-        self.depth_frames: np.ndarray = np.load(os.path.join(folder, "depth_raw.npy"))
+        print(f"depth_intrinsics: {self.depth_intrinsics}")
+        print(f"color_intrinsics: {self.color_intrinsics}")
+        
+        # Load from zarr (zarr doesn't support negative step slicing, so load to numpy first)
+        color_zarr = zarr.open_array(os.path.join(folder, "color_raw.zarr"), mode='r')
+        depth_zarr = zarr.open_array(os.path.join(folder, "depth_raw.zarr"), mode='r')
+        
+        # Load to numpy arrays and convert BGR to RGB
+        self.color_frames: np.ndarray = np.asarray(color_zarr)[..., ::-1]  # Convert BGR to RGB
+        self.depth_frames: np.ndarray = np.asarray(depth_zarr)
 
         if self.color_frames.shape[0] != self.depth_frames.shape[0]:
             raise ValueError(
@@ -134,7 +149,7 @@ class ArucoTracker:
         self.rgbd = rgbd
         self.marker_size_m = marker_size_m
 
-        intr = rgbd.intrinsics
+        intr = rgbd.depth_intrinsics
         self.camera_matrix = np.array([
             [intr["fx"],  0.,          intr["ppx"]],
             [0.,          intr["fy"],  intr["ppy"]],
@@ -448,11 +463,14 @@ class ArucoTracker:
         plt.show()
 
 if __name__ == "__main__":
-    data = RGBDData("data/raw_camera_data_2")
+    data = RGBDData("data/run_2")
 
     # for i in range (10):
-    #     data.plot_pointcloud(100*i)
-    aruco_tracker = ArucoTracker(data)
+    #     data.plot_pointcloud(3*i)
+
+    data.plot_frame(0)
+    data.plot_pointcloud(0)
+    # aruco_tracker = ArucoTracker(data)
     # aruco_tracker.plot_frame(500)
     # data.plot_pointcloud(0, 100000)
     # start_ns = time.perf_counter_ns()
@@ -460,4 +478,4 @@ if __name__ == "__main__":
     # elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
     # print(f"detect(500) took {elapsed_ms:.3f} ms")
     
-    aruco_tracker.plot_pointcloud_with_marker(0, 0.5)
+    # aruco_tracker.plot_pointcloud_with_marker(0, 0.5)
