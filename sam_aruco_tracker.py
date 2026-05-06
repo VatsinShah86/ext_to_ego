@@ -20,35 +20,130 @@ class ArucoSAMTracker:
         self.corners = None
         self.mask = None
 
-    def extract_marker(self, image_rgb: np.ndarray, marker_x: int, marker_y: int) -> np.ndarray:
+    def extract_marker(self, image_rgb: np.ndarray, marker_x: int, marker_y: int,
+                       box_size: int = 40) -> np.ndarray:
         """
-        Given a manually specified point on the marker, segments it with SAM,
-        extracts the 4 corners, and saves the marker crop as a template.
+        Given a manually specified point on the marker, segments it with SAM
+        using a box prompt, extracts the 4 corners, and saves the marker crop
+        as a template for future matching.
 
         Args:
             image_rgb: RGB image as numpy array (H, W, 3)
-            marker_x: x pixel coordinate of the marker center
-            marker_y: y pixel coordinate of the marker center
+            marker_x:  x pixel coordinate of the marker center
+            marker_y:  y pixel coordinate of the marker center
+            box_size:  side length of the box prompt around the click point.
+                       Increase if the marker is large in the image.
 
         Returns:
             corners: (4, 2) array of corner pixel coordinates
         """
         self.predictor.set_image(image_rgb)
+
+        x1 = marker_x - box_size // 2
+        y1 = marker_y - box_size // 2
+        x2 = marker_x + box_size // 2
+        y2 = marker_y + box_size // 2
+
         masks, scores, _ = self.predictor.predict(
-            point_coords=np.array([[marker_x, marker_y]]),
-            point_labels=np.array([1]),
+            box=np.array([x1, y1, x2, y2]),
             multimask_output=True
         )
 
         self.mask = masks[np.argmax(scores)]
         self.corners = self._extract_corners(self.mask)
 
-        # Save the marker crop as template
-        x1, y1 = self.corners.min(axis=0)
-        x2, y2 = self.corners.max(axis=0)
-        self.template = image_rgb[y1:y2, x1:x2]
+        # Save the tight crop as template for future template matching
+        cx1, cy1 = self.corners.min(axis=0)
+        cx2, cy2 = self.corners.max(axis=0)
+        self.template = image_rgb[cy1:cy2, cx1:cx2]
 
         return self.corners
+
+    def find_marker(self, image_rgb: np.ndarray, use_sam: bool = True,
+                    rotation_search: bool = True) -> np.ndarray:
+        """
+        Uses template matching to locate the marker in a new frame,
+        then optionally refines the segmentation with SAM using a box prompt.
+
+        Args:
+            image_rgb:        RGB image as numpy array (H, W, 3)
+            use_sam:          if True, refines mask with SAM using the template
+                              match bounding box as the prompt. If False, returns
+                              the bounding box corners from template matching directly.
+            rotation_search:  if True, searches ±45° in 5° increments to handle
+                              marker rotation between frames.
+
+        Returns:
+            corners: (4, 2) array of corner pixel coordinates
+        """
+        if self.template is None:
+            raise RuntimeError("No template saved. Call extract_marker() first.")
+
+        best_val, best_loc, best_angle, best_template = self._template_search(
+            image_rgb, rotation_search
+        )
+
+        if best_val < 0.6:
+            print(f"Warning: low confidence match ({best_val:.2f}).")
+
+        th, tw = best_template.shape[:2]
+        x1, y1 = best_loc
+        x2, y2 = x1 + tw, y1 + th
+        print(f"Template match confidence: {best_val:.2f}, angle: {best_angle:.1f}°")
+        print(f"Bounding box: ({x1}, {y1}) -> ({x2}, {y2})")
+
+        if not use_sam:
+            self.corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+            return self.corners
+
+        self.predictor.set_image(image_rgb)
+
+        masks, scores, _ = self.predictor.predict(
+            box=np.array([x1, y1, x2, y2]),
+            multimask_output=True
+        )
+
+        self.mask = masks[np.argmax(scores)]
+        self.corners = self._extract_corners(self.mask)
+        return self.corners
+
+    def _template_search(self, image_rgb: np.ndarray,
+                         rotation_search: bool) -> tuple:
+        """
+        Searches for the best template match, optionally across multiple rotations.
+
+        Args:
+            image_rgb:       RGB image to search in
+            rotation_search: if True, searches ±45° in 5° increments
+
+        Returns:
+            best_val:      best match confidence score
+            best_loc:      (x, y) top-left pixel of the best match
+            best_angle:    rotation angle (degrees) that gave the best match
+            best_template: the rotated template that gave the best match
+        """
+        best_val, best_loc, best_angle, best_template = 0, None, 0, self.template
+
+        angles = np.arange(-45, 46, 5) if rotation_search else [0]
+
+        for angle in angles:
+            if angle == 0:
+                rotated = self.template
+            else:
+                h, w = self.template.shape[:2]
+                M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+                rotated = cv2.warpAffine(self.template, M, (w, h))
+
+            result = cv2.matchTemplate(image_rgb, rotated, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+                best_angle = angle
+                best_template = rotated
+
+        return best_val, best_loc, best_angle, best_template
 
     def _extract_corners(self, mask: np.ndarray) -> np.ndarray:
         """
@@ -76,15 +171,14 @@ class ArucoSAMTracker:
         if len(approx) != 4:
             print(f"approxPolyDP gave {len(approx)} corners, falling back to minAreaRect")
             rect = cv2.minAreaRect(contour)
-            approx = cv2.boxPoints(rect)
-            return np.int32(approx)
+            return np.int32(cv2.boxPoints(rect))
 
         return approx.reshape(4, 2)
 
     def show_marker(self, image_rgb: np.ndarray):
         """
         Displays the image with the extracted corners and mask overlaid.
-        Requires extract_marker() to have been called first.
+        Requires extract_marker() or find_marker() to have been called first.
 
         Args:
             image_rgb: RGB image as numpy array (H, W, 3)
@@ -94,7 +188,6 @@ class ArucoSAMTracker:
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-        # Left: corners overlaid on image
         debug = image_rgb.copy()
         for pt in self.corners:
             cv2.circle(debug, tuple(pt), 2, (0, 255, 0), -1)
@@ -103,7 +196,6 @@ class ArucoSAMTracker:
         axes[0].set_title("Detected Corners")
         axes[0].axis("off")
 
-        # Right: isolated mask
         axes[1].imshow(self.mask, cmap="gray")
         axes[1].set_title("SAM Mask")
         axes[1].axis("off")
@@ -111,76 +203,20 @@ class ArucoSAMTracker:
         plt.tight_layout()
         plt.show()
 
-    def find_marker(self, image_rgb: np.ndarray, use_sam: bool = True) -> np.ndarray:
-        """
-        Uses template matching to locate the marker in a new frame,
-        then optionally refines the corners with SAM.
-
-        Args:
-            image_rgb: RGB image as numpy array (H, W, 3)
-            use_sam: if True, refines corners with SAM using the template
-                    match center as the prompt point. If False, returns
-                    the bounding box corners from template matching directly.
-
-        Returns:
-            corners: (4, 2) array of corner pixel coordinates
-        """
-        if self.template is None:
-            raise RuntimeError("No template saved. Call extract_marker() first.")
-
-        # Template matching
-        result = cv2.matchTemplate(image_rgb, self.template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-        if max_val < 0.6:
-            print(f"Warning: low confidence match ({max_val:.2f}). Marker may not be visible.")
-
-        # Compute center of the matched region
-        th, tw = self.template.shape[:2]
-        top_left = max_loc
-        marker_x = top_left[0] + tw // 2
-        marker_y = top_left[1] + th // 2
-
-        print(f"Template match confidence: {max_val:.2f} at ({marker_x}, {marker_y})")
-
-        if not use_sam:
-            # Just return the 4 bbox corners from the template match
-            x1, y1 = top_left
-            x2, y2 = x1 + tw, y1 + th
-            self.corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
-            return self.corners
-
-        # Refine with SAM using the match center as prompt
-        self.predictor.set_image(image_rgb)
-        masks, scores, _ = self.predictor.predict(
-            point_coords=np.array([[marker_x, marker_y]]),
-            point_labels=np.array([1]),
-            multimask_output=True
-        )
-
-        self.mask = masks[np.argmax(scores)]
-        self.corners = self._extract_corners(self.mask)
-
-        return self.corners
 
 if __name__ == "__main__":
     data = RGBDData("data/raw_camera_data")
     image_rgb, _ = data.get_frame(400)
 
-    # plt.imshow(image_rgb)
-    # plt.show()
-
     tracker = ArucoSAMTracker()
     corners = tracker.extract_marker(image_rgb, marker_x=365, marker_y=164)
 
-    # Any other frame: template match → SAM refine
     frame_id_1 = 400
     image_rgb_1, _ = data.get_frame(frame_id_1)
     corners = tracker.find_marker(image_rgb_1)
     print(f"Corners in frame {frame_id_1}:", corners)
     tracker.show_marker(image_rgb_1)
 
-    # Any other frame: template match → SAM refine
     image_rgb_5, _ = data.get_frame(5)
     corners = tracker.find_marker(image_rgb_5)
     print("Corners in frame 5:", corners)
