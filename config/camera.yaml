@@ -5,18 +5,18 @@ camera:
 
   # --- Image Sensor ---
   resolution:
-    width: 1920
-    height: 1080
+    width: 640
+    height: 480
 
   # --- Intrinsics (pinhole model) ---
   intrinsics:
     # Using example values found online for now, will replace with real values later
     focal_length:
-      fx: 912.36  # pixels — horizontal focal length
-      fy: 910.26  # pixels — vertical focal length (equal to fx for square pixels)
+      fx: 605.622009277343  # pixels — horizontal focal length
+      fy: 605.2809448242188  # pixels — vertical focal length (equal to fx for square pixels)
     principal_point:
-      cx: 960.0   # pixels — typically width / 2
-      cy: 540.0   # pixels — typically height / 2
+      cx: 316.6953125   # pixels — typically width / 2
+      cy: 252.77352905273438  # pixels — typically height / 2
 
   # --- Clip Planes ---
   clip:

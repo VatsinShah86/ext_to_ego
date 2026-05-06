@@ -205,19 +205,37 @@ class ArucoSAMTracker:
 
 
 if __name__ == "__main__":
-    data = RGBDData("data/raw_camera_data")
+    data = RGBDData("data/raw_camera_data_2")
     image_rgb, _ = data.get_frame(400)
 
-    tracker = ArucoSAMTracker()
-    corners = tracker.extract_marker(image_rgb, marker_x=365, marker_y=164)
+    # tracker = ArucoSAMTracker()
+    # corners = tracker.extract_marker(image_rgb, marker_x=365, marker_y=164)
 
-    frame_id_1 = 400
-    image_rgb_1, _ = data.get_frame(frame_id_1)
-    corners = tracker.find_marker(image_rgb_1)
-    print(f"Corners in frame {frame_id_1}:", corners)
-    tracker.show_marker(image_rgb_1)
+    # frame_id_1 = 400
+    # image_rgb_1, _ = data.get_frame(frame_id_1)
+    # corners = tracker.find_marker(image_rgb_1)
+    # print(f"Corners in frame {frame_id_1}:", corners)
+    # tracker.show_marker(image_rgb_1)
 
-    image_rgb_5, _ = data.get_frame(5)
-    corners = tracker.find_marker(image_rgb_5)
-    print("Corners in frame 5:", corners)
-    tracker.show_marker(image_rgb_5)
+    # image_rgb_5, _ = data.get_frame(5)
+    # corners = tracker.find_marker(image_rgb_5)
+    # print("Corners in frame 5:", corners)
+    # tracker.show_marker(image_rgb_5)
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model_type = "vit_h"
+    checkpoint = "sam_vit_h_4b8939.pth"
+    sam = sam_model_registry[model_type](checkpoint=checkpoint)
+    sam.to(device)
+    predictor = SamPredictor(sam)
+    predictor.set_image(image_rgb)
+    masks, scores, _ = predictor.predict()
+    colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+    fig, ax = plt.subplots()
+    ax.imshow(image_rgb)
+    for mask, color in zip(masks, colors):
+        overlay = np.zeros((*mask.shape, 4))
+        overlay[mask] = [*color, 0.4]
+        ax.imshow(overlay)
+    ax.axis("off")
+    plt.show()

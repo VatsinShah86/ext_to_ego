@@ -1,7 +1,10 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
+import cv2
 from scipy.spatial import cKDTree
+from vision import RGBDData, ArucoTracker, MarkerDetection
+
 
 def create_example_pc(density: float = 10):
     """
@@ -34,6 +37,7 @@ def create_example_pc(density: float = 10):
     points[:, 1] = np.tile(coords, point_count)
     points[:, 2] = 0.0
     return points
+
 
 def create_box_pc(center: np.ndarray, length: float, width: float, height: float, density: float = 10) -> np.ndarray:
     """
@@ -86,59 +90,41 @@ def create_box_pc(center: np.ndarray, length: float, width: float, height: float
     xy_x, xy_y = np.meshgrid(x_coords, y_coords, indexing="ij")
 
     faces = [
-        np.column_stack([
-            np.full(yz_y.size, x_min, dtype=np.float32),
-            yz_y.ravel(),
-            yz_z.ravel(),
-        ]),
-        np.column_stack([
-            np.full(yz_y.size, x_max, dtype=np.float32),
-            yz_y.ravel(),
-            yz_z.ravel(),
-        ]),
-        np.column_stack([
-            xz_x.ravel(),
-            np.full(xz_x.size, y_min, dtype=np.float32),
-            xz_z.ravel(),
-        ]),
-        np.column_stack([
-            xz_x.ravel(),
-            np.full(xz_x.size, y_max, dtype=np.float32),
-            xz_z.ravel(),
-        ]),
-        np.column_stack([
-            xy_x.ravel(),
-            xy_y.ravel(),
-            np.full(xy_x.size, z_min, dtype=np.float32),
-        ]),
-        np.column_stack([
-            xy_x.ravel(),
-            xy_y.ravel(),
-            np.full(xy_x.size, z_max, dtype=np.float32),
-        ]),
+        np.column_stack([np.full(yz_y.size, x_min, dtype=np.float32), yz_y.ravel(), yz_z.ravel()]),
+        np.column_stack([np.full(yz_y.size, x_max, dtype=np.float32), yz_y.ravel(), yz_z.ravel()]),
+        np.column_stack([xz_x.ravel(), np.full(xz_x.size, y_min, dtype=np.float32), xz_z.ravel()]),
+        np.column_stack([xz_x.ravel(), np.full(xz_x.size, y_max, dtype=np.float32), xz_z.ravel()]),
+        np.column_stack([xy_x.ravel(), xy_y.ravel(), np.full(xy_x.size, z_min, dtype=np.float32)]),
+        np.column_stack([xy_x.ravel(), xy_y.ravel(), np.full(xy_x.size, z_max, dtype=np.float32)]),
     ]
 
     points = np.vstack(faces).astype(np.float32, copy=False)
     return np.unique(points, axis=0)
+
 
 def plot_pc(pc: np.ndarray):
     """
     Display a 3D scatter plot for a point cloud.
 
     Args:
-        pc: (N, 3) array-like collection of 3D points.
-
-    Returns:
-        None.
+        pc: (N, 3) xyz or (N, 6) xyzrgb array. RGB values are expected in
+            the 0–255 range and are normalised to 0–1 for display.
     """
     pc = np.asarray(pc)
-    assert pc.ndim == 2 and pc.shape[1] == 3, "pc must have shape (N, 3)"
+    assert pc.ndim == 2 and pc.shape[1] in (3, 6), "pc must have shape (N, 3) or (N, 6)"
+
+    xyz    = pc[:, :3]
+    colors = pc[:, 3:] / 255.0 if pc.shape[1] == 6 else None
 
     fig = plt.figure()
     ax = fig.add_subplot(projection="3d")
-    ax.scatter(pc[:, 0], pc[:, 1], pc[:, 2], s=1)
+    ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=colors, s=1, linewidths=0)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
 
     if pc.shape[0] > 0:
+        pc = xyz
         mins = pc.min(axis=0)
         maxs = pc.max(axis=0)
 
@@ -160,268 +146,165 @@ def plot_pc(pc: np.ndarray):
 
     plt.show()
 
-def load_camera_config(path: str) -> dict:
+
+class Ext2Ego:
+    """Full pipeline from an external RGBD camera to an egocentric camera frame.
+
+    Chains RGBDData point cloud generation, ArucoTracker pose estimation,
+    coordinate transform, frustum culling, and occlusion culling into a
+    single per-frame process() call.
     """
-    Load camera parameters from a YAML configuration file.
 
-    Args:
-        path: Filesystem path to the camera config file.
+    def __init__(self, rgbd: RGBDData, tracker: ArucoTracker, config_path: str):
+        self.rgbd    = rgbd
+        self.tracker = tracker
+        self.T_cw: np.ndarray | None = None
 
-    Returns:
-        camera: Dict containing image size, field of view, and clip distances.
-    """
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)["camera"]
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)["camera"]
 
-    W = cfg["resolution"]["width"]
-    H = cfg["resolution"]["height"]
-    clip = cfg["clip"]
+        W  = cfg["resolution"]["width"]
+        H  = cfg["resolution"]["height"]
+        fx = cfg["intrinsics"]["focal_length"]["fx"]
+        fy = cfg["intrinsics"]["focal_length"]["fy"]
+        cx = cfg["intrinsics"]["principal_point"]["cx"]
+        cy = cfg["intrinsics"]["principal_point"]["cy"]
 
-    fx = cfg["intrinsics"]["focal_length"]["fx"]
-    fy = cfg["intrinsics"]["focal_length"]["fy"]
-    hfov = np.degrees(2 * np.arctan(W / (2 * fx)))
-    vfov = np.degrees(2 * np.arctan(H / (2 * fy)))
+        self.cam_name = cfg["name"]
+        self.width    = W
+        self.height   = H
+        self.fx       = fx
+        self.fy       = fy
+        self.cx       = cx
+        self.cy       = cy
+        self.z_near   = cfg["clip"]["near"]
+        self.z_far    = cfg["clip"]["far"]
 
-    cx = cfg["intrinsics"]["principal_point"]["cx"]
-    cy = cfg["intrinsics"]["principal_point"]["cy"]
+        self._tan_h = np.tan(np.radians(np.degrees(2 * np.arctan(W / (2 * fx))) / 2))
+        self._tan_v = np.tan(np.radians(np.degrees(2 * np.arctan(H / (2 * fy))) / 2))
 
-    return {
-        "name":    cfg["name"],
-        "width":   W,
-        "height":  H,
-        "hfov":    hfov,
-        "vfov":    vfov,
-        "z_near":  clip["near"],
-        "z_far":   clip["far"],
-        "fx":      fx,
-        "fy":      fy,
-        "cx":      cx,
-        "cy":      cy,
-    }
+    def set_pose(self, R_wc: np.ndarray, camera_pos: np.ndarray) -> None:
+        """Set the ego camera pose from get_camera_pose() output.
 
-def transform_points_to_camera_frame(points_world: np.ndarray, T_cw: np.ndarray) -> np.ndarray:
-    """
-    Transform world-space points into camera-space.
+        R_wc has columns = ego camera axes in the RealSense frame.
+        camera_pos is the ego camera origin in the RealSense frame.
+        """
+        R = R_wc.T
+        t = -R @ camera_pos
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3,  3] = t
+        self.T_cw = T
 
-    Args:
-        points_world: (N, 3) float array of points in world frame.
-        T_cw:         (4, 4) homogeneous world-to-camera transform.
+    def transform(self, points: np.ndarray) -> np.ndarray:
+        """Transform (N, 3) points from RealSense frame to ego camera frame."""
+        if self.T_cw is None:
+            raise RuntimeError("Call set_pose() before transform().")
+        pts_h = np.hstack([points, np.ones((len(points), 1))])
+        return (self.T_cw @ pts_h.T).T[:, :3]
 
-    Returns:
-        points_cam: (N, 3) float array of points in camera frame.
-    """
-    N = len(points_world)
-    pts_h = np.hstack([points_world, np.ones((N, 1))])  # (N, 4) homogeneous
-    pts_cam = (T_cw @ pts_h.T).T                         # (N, 4)
-    return pts_cam[:, :3]
+    def filter_frustum(self, points_cam: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (visible_points, mask) after frustum culling."""
+        x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
+        mask = (
+            (z >  0)                &
+            (z >= self.z_near)      &
+            (z <= self.z_far)       &
+            (x <=  z * self._tan_h) &
+            (x >= -z * self._tan_h) &
+            (y <=  z * self._tan_v) &
+            (y >= -z * self._tan_v)
+        )
+        return points_cam[mask], mask
 
+    def cull_occlusion(self, points_cam: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (visible_points, mask) using depth-buffer rasterisation."""
+        x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
 
-def build_frustum(hfov_deg: float, vfov_deg: float, z_near: float, z_far: float) -> dict:
-    """
-    Precompute the frustum parameters from camera intrinsics.
+        u = (self.fx * x / z + self.cx).astype(int)
+        v = (self.fy * y / z + self.cy).astype(int)
 
-    Args:
-        hfov_deg: Horizontal field of view in degrees.
-        vfov_deg: Vertical field of view in degrees.
-        z_near:   Near clip distance in meters.
-        z_far:    Far clip distance in meters.
+        in_bounds = (u >= 0) & (u < self.width) & (v >= 0) & (v < self.height)
+        u, v, z   = u[in_bounds], v[in_bounds], z[in_bounds]
+        orig_idx  = np.where(in_bounds)[0]
 
-    Returns:
-        A dict of precomputed frustum values ready for point testing.
-    """
-    return {
-        "tan_h": np.tan(np.radians(hfov_deg / 2)),
-        "tan_v": np.tan(np.radians(vfov_deg / 2)),
-        "z_near": z_near,
-        "z_far":  z_far,
-    }
+        depth_buf = np.full((self.height, self.width), np.inf)
+        np.minimum.at(depth_buf, (v, u), z)
 
+        visible_local = np.isclose(z, depth_buf[v, u])
+        mask = np.zeros(len(points_cam), dtype=bool)
+        mask[orig_idx[visible_local]] = True
+        return points_cam[mask], mask
 
-def filter_points_in_frustum(points_cam: np.ndarray, frustum: dict) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Remove points that fall outside the camera frustum.
+    def cull_occlusion_soft(
+        self, points_cam: np.ndarray, pixel_radius: float = 12.5
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (visible_points, mask) using KD-tree soft occlusion culling."""
+        x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
 
-    Args:
-        points_cam: (N, 3) float array of points in camera frame.
-        frustum:    Dict produced by build_frustum().
+        u = self.fx * x / z + self.cx
+        v = self.fy * y / z + self.cy
 
-    Returns:
-        visible_points: (M, 3) subset of points_cam that lie inside the frustum.
-        mask:           (N,) boolean array — True where a point passed all 6 tests.
-    """
-    x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
+        in_bounds = (u >= 0) & (u < self.width) & (v >= 0) & (v < self.height)
+        u, v, z_in = u[in_bounds], v[in_bounds], z[in_bounds]
+        orig_idx   = np.where(in_bounds)[0]
 
-    tan_h  = frustum["tan_h"]
-    tan_v  = frustum["tan_v"]
-    z_near = frustum["z_near"]
-    z_far  = frustum["z_far"]
+        tree = cKDTree(np.stack([u, v], axis=1))
 
-    mask = (
-        (z > 0)          &   # point in front of camera
-        (z >= z_near)    &   # near plane
-        (z <= z_far)     &   # far plane
-        (x <= z * tan_h) &   # right plane
-        (x >= -z * tan_h) &  # left plane
-        (y <= z * tan_v) &   # top plane
-        (y >= -z * tan_v)    # bottom plane
-    )
+        mask_local = np.ones(len(u), dtype=bool)
+        for i, (ui, vi, zi) in enumerate(zip(u, v, z_in)):
+            neighbor_z = z_in[tree.query_ball_point([ui, vi], r=pixel_radius)]
+            if np.any(neighbor_z < zi - 1e-3):
+                mask_local[i] = False
 
-    return points_cam[mask], mask
+        mask = np.zeros(len(points_cam), dtype=bool)
+        mask[orig_idx[mask_local]] = True
+        return points_cam[mask], mask
 
-def make_T_cw(R: np.ndarray, camera_pos_world: np.ndarray) -> np.ndarray:
-    """
-    Build a world-to-camera transform from a rotation matrix and
-    the camera's position in world space.
+    def process(
+        self, index: int, occlusion: bool = False
+    ) -> tuple[np.ndarray, MarkerDetection | None]:
+        """Run the full pipeline for frame *index*.
 
-    Args:
-        R:                (3,3) rotation matrix (world-to-camera)
-        camera_pos_world: (3,) camera position in world frame
+        Args:
+            index:     Frame index into the RGBD dataset.
+            occlusion: If False, skip occlusion culling (faster, useful for testing).
 
-    Returns:
-        T_cw: (4,4) homogeneous world-to-camera transform
-    """
-    t = -R @ camera_pos_world  # translation in camera space
-    T = np.eye(4, dtype=np.float32)
-    T[:3, :3] = R
-    T[:3,  3] = t
-    return T
+        Returns (visible_points, det) where visible_points is an (M, 6) xyzrgb
+        array in ego camera frame, and det is the MarkerDetection used to derive
+        the ego camera pose (None if the marker was not found).
+        """
+        pc  = self.rgbd.get_pointcloud(index)   # (N, 6) xyzrgb
+        det = self.tracker.detect_plane(index)
+        self.tracker.plot_pointcloud_with_marker(index)
+        if det is None:
+            return np.empty((0, 6), dtype=np.float32), None
 
-def depth_buffer_occlusion(
-    points_cam: np.ndarray,
-    fx: float, fy: float,
-    cx: float, cy: float,
-    width: int, height: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Cull occluded points using depth buffer rasterization.
-    Must be called on points already in camera frame and inside the frustum.
+        R, t = self.tracker.get_camera_pose(det)
+        self.set_pose(R, t)
 
-    Args:
-        points_cam: (N, 3) points in camera frame, already frustum-culled.
-        fx, fy:     Focal lengths in pixels.
-        cx, cy:     Principal point in pixels.
-        width:      Image width in pixels.
-        height:     Image height in pixels.
+        xyz_cam             = self.transform(pc[:, :3])
+        _, frustum_mask     = self.filter_frustum(xyz_cam)
 
-    Returns:
-        visible_points: (M, 3) subset of points_cam that are not occluded.
-        mask:           (N,) boolean array — True where a point is visible.
-    """
-    x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
+        xyz_frustum = xyz_cam[frustum_mask]
+        rgb_frustum = pc[frustum_mask, 3:]
+        result      = np.concatenate([xyz_frustum, rgb_frustum], axis=1)
 
-    # --- Project to pixel coordinates ---
-    u = (fx * x / z + cx).astype(int)
-    v = (fy * y / z + cy).astype(int)
+        if occlusion:
+            _, occ_mask = self.cull_occlusion(xyz_frustum)
+            result      = result[occ_mask]
 
-    # --- Clip to image bounds (sanity check — frustum cull should already ensure this) ---
-    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
-    u = u[in_bounds]
-    v = v[in_bounds]
-    z = z[in_bounds]
-    original_indices = np.where(in_bounds)[0]
+        return result, det
 
-    # --- Build depth buffer ---
-    depth_buffer = np.full((height, width), np.inf)
-    np.minimum.at(depth_buffer, (v, u), z)  # for each pixel, store minimum z
-
-    # --- A point is visible if its z matches the depth buffer at its pixel ---
-    z_at_pixel = depth_buffer[v, u]
-    visible_local = np.isclose(z, z_at_pixel)
-
-    # --- Map back to original indexing ---
-    mask = np.zeros(len(points_cam), dtype=bool)
-    mask[original_indices[visible_local]] = True
-
-    return points_cam[mask], mask
-
-
-def depth_buffer_occlusion_2(points_cam, fx, fy, cx, cy, width, height, pixel_radius=12.5):
-    x, y, z = points_cam[:, 0], points_cam[:, 1], points_cam[:, 2]
-
-    # Project to image plane
-    u = fx * x / z + cx
-    v = fy * y / z + cy
-
-    in_bounds = (u >= 0) & (u < width) & (v >= 0) & (v < height)
-    u = u[in_bounds]
-    v = v[in_bounds]
-    z_in = z[in_bounds]
-    original_indices = np.where(in_bounds)[0]
-
-    # Build KD-tree in projected (u, v) space
-    uv = np.stack([u, v], axis=1)  # (N, 2)
-    tree = cKDTree(uv)
-
-    # For each point, find all neighbors within pixel_radius pixels
-    # A point is occluded if any neighbor is closer in z
-    mask_local = np.ones(len(u), dtype=bool)
-    for i, (ui, vi, zi) in enumerate(zip(u, v, z_in)):
-        neighbor_idxs = tree.query_ball_point([ui, vi], r=pixel_radius)
-        neighbor_z = z_in[neighbor_idxs]
-        if np.any(neighbor_z < zi - 1e-3):  # any strictly closer neighbor?
-            mask_local[i] = False
-
-    mask = np.zeros(len(points_cam), dtype=bool)
-    mask[original_indices[mask_local]] = True
-    return points_cam[mask], mask
 
 def main():
-    """
-    Run the example point-cloud and camera-config workflow.
-
-    Args:
-        None.
-
-    Returns:
-        None.
-    """
     print("Hello from ext-to-ego!")
-    pc_density = 1000
-    pc = create_example_pc(pc_density)
-    pc = np.append(pc,create_box_pc(np.array([0, 0.2, 0.2]), 0.1, 0.1, 0.1, pc_density), axis = 0)
-    print(pc.shape)
-    # plot_pc(pc)
+    data = RGBDData('data/raw_camera_data_2')
+    tracker = ArucoTracker(data)
+    pipeline = Ext2Ego(data, tracker, 'config/camera.yaml')
+    pts, det = pipeline.process(400)
+    plot_pc(pts)
 
-    # Load Camera Intrinsics
-    cam = load_camera_config("config/camera.yaml")
-    print(cam)
-
-    # Sim camera at (0, 0, 0.5) looking down.
-    T_cw = make_T_cw(np.diag([1,-1,-1]), np.array([0,0,0.5]))
-
-    # Transform points from initial frame to sim_camera frame
-    pts_cam = transform_points_to_camera_frame(pc, T_cw)
-    # plot_pc(pts_cam)
-
-    # Build frustum
-    frustum = build_frustum(cam['hfov'], cam['vfov'], cam['z_near'], cam['z_far'])
-
-    # Filter points out of the frustum
-    pts_cam_filtered, mask = filter_points_in_frustum(pts_cam, frustum)
-
-    # Plot out new ground
-    # plot_pc(pts_cam_filtered)
-
-    # Occlusion culling
-    final_cam, occlusion_mask = depth_buffer_occlusion(
-        pts_cam_filtered,
-        fx=cam["fx"], fy=cam["fy"],
-        cx=cam["cx"], cy=cam["cy"],
-        width=cam["width"], height=cam["height"],
-    )
-
-    # Plot final
-    plot_pc(final_cam)
-
-    # Occlusion culling
-    final_cam_2, occlusion_mask_2 = depth_buffer_occlusion_2(
-        pts_cam_filtered,
-        fx=cam["fx"], fy=cam["fy"],
-        cx=cam["cx"], cy=cam["cy"],
-        width=cam["width"], height=cam["height"],
-    )
-
-    plot_pc(final_cam_2)
 
 if __name__ == "__main__":
     main()

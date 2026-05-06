@@ -11,12 +11,12 @@ class RGBDData:
 
     def __init__(self, folder: str):
         meta = np.load(os.path.join(folder, "metadata.npz"), allow_pickle=True)
-
         self.depth_scale: float = float(meta["depth_scale"])
         self.timestamps: np.ndarray = meta["timestamps"]
         self.recording_time: str = str(meta["recording_time"])
         self.intrinsics: dict = meta["intrinsics"].item()  # fx, fy, ppx, ppy, width, height
-
+        print(f"depth_scale: {self.depth_scale}")
+        print(f"intrinsics: {self.intrinsics}")
         self.color_frames: np.ndarray = np.load(os.path.join(folder, "color_raw.npy"))[..., ::-1]
         self.depth_frames: np.ndarray = np.load(os.path.join(folder, "depth_raw.npy"))
 
@@ -68,7 +68,7 @@ class RGBDData:
 
         Uniformly subsamples to *max_points* when the cloud is larger.
         """
-        pc = self.get_pointcloud(index)
+        pc = self.get_pointcloud(index, 3)
 
         if len(pc) > max_points:
             idx = np.random.choice(len(pc), max_points, replace=False)
@@ -448,10 +448,10 @@ class ArucoTracker:
         plt.show()
 
 if __name__ == "__main__":
-    data = RGBDData("data/raw_camera_data_3")
+    data = RGBDData("data/raw_camera_data_2")
 
     # for i in range (10):
-    #     data.plot_frame(100*i)
+    #     data.plot_pointcloud(100*i)
     aruco_tracker = ArucoTracker(data)
     # aruco_tracker.plot_frame(500)
     # data.plot_pointcloud(0, 100000)
