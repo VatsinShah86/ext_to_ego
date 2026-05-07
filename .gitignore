@@ -8,6 +8,6 @@ wheels/
 *.png
 *.pth
 .DS_Store
-
+*.pt
 # Virtual environments
 .venv
