@@ -51,10 +51,14 @@ class RGBDData:
             raise IndexError(f"Frame index {index} out of range [0, {self.num_frames - 1}]")
         return self.color_frames[index], self.depth_frames[index].astype(np.float32) * self.depth_scale
 
-    def get_pointcloud(self, index: int, max_z: float = 10.0) -> np.ndarray:
-        """Return an (N, 6) float32 array of (x, y, z, r, g, b) for valid depth pixels.
+    def get_pointcloud(self, index: int, max_z: float = 10.0,
+                       label_map: np.ndarray | None = None) -> np.ndarray:
+        """Return an (N, 6) or (N, 7) float32 array for valid depth pixels.
 
-        xyz is in metres in camera space. rgb is uint8 values (0–255) as float32.
+        Columns: x, y, z  (metres, camera space)
+                 r, g, b  (uint8 values as float32, 0–255)
+                 seg_id   (int32 as float32, only if label_map is provided)
+
         Pixels with zero depth or z > max_z are excluded.
         """
         color_rgb, depth_m = self.get_frame(index)
@@ -76,21 +80,39 @@ class RGBDData:
         xyz = np.stack([x, y, z], axis=-1)[valid]
         rgb = color_rgb[valid].astype(np.float32)
 
+        if label_map is not None:
+            seg_ids = label_map[valid].astype(np.float32).reshape(-1, 1)
+            return np.concatenate([xyz, rgb, seg_ids], axis=-1)
+
         return np.concatenate([xyz, rgb], axis=-1)
 
-    def plot_pointcloud(self, index: int, max_points: int = 30_000) -> None:
-        """Plot the 3D point cloud for the given frame, coloured by RGB.
+    def plot_pointcloud(self, index: int, max_points: int = 30_000,
+                        label_map: np.ndarray | None = None) -> None:
+        """Plot the 3D point cloud for the given frame.
 
+        If label_map is provided, each segment gets a randomly assigned colour
+        for debugging — the actual point data is not modified.
         Uniformly subsamples to *max_points* when the cloud is larger.
         """
-        pc = self.get_pointcloud(index, 3)
+        pc = self.get_pointcloud(index, label_map=label_map)
 
         if len(pc) > max_points:
             idx = np.random.choice(len(pc), max_points, replace=False)
             pc = pc[idx]
 
         x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
-        colors = pc[:, 3:] / 255.0
+
+        if label_map is not None:
+            seg_ids = pc[:, 6].astype(int)
+            unique_ids = np.unique(seg_ids)
+            rng = np.random.default_rng(42)
+            id_to_color = {uid: (rng.random(3) if uid > 0 else np.array([0.5, 0.5, 0.5]))
+                           for uid in unique_ids}
+            colors = np.array([id_to_color[sid] for sid in seg_ids])
+            title_suffix = "  [segmentation colours]"
+        else:
+            colors = pc[:, 3:6] / 255.0
+            title_suffix = ""
 
         fig = plt.figure(figsize=(10, 7))
         ax = fig.add_subplot(111, projection="3d")
@@ -100,7 +122,7 @@ class RGBDData:
         ax.set_ylabel("Y (m)")
         ax.set_zlabel("Z (m)")
         ax.set_title(f"Point cloud — frame {index}  |  t = {self.timestamps[index]:.3f} s"
-                     f"  ({len(pc):,} pts shown)")
+                     f"  ({len(pc):,} pts shown){title_suffix}")
         plt.tight_layout()
         plt.show()
 

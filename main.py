@@ -4,6 +4,7 @@ import yaml
 import cv2
 from scipy.spatial import cKDTree
 from vision import RGBDData, ArucoTracker, MarkerDetection
+from segmentation import Segmentation
 
 
 def create_example_pc(density: float = 10):
@@ -111,10 +112,10 @@ def plot_pc(pc: np.ndarray):
             the 0–255 range and are normalised to 0–1 for display.
     """
     pc = np.asarray(pc)
-    assert pc.ndim == 2 and pc.shape[1] in (3, 6), "pc must have shape (N, 3) or (N, 6)"
+    assert pc.ndim == 2 and pc.shape[1] in (3, 6, 7), "pc must have shape (N, 3), (N, 6), or (N, 7)"
 
     xyz    = pc[:, :3]
-    colors = pc[:, 3:] / 255.0 if pc.shape[1] == 6 else None
+    colors = pc[:, 3:6] / 255.0 if pc.shape[1] >= 6 else None
 
     fig = plt.figure()
     ax = fig.add_subplot(projection="3d")
@@ -155,9 +156,11 @@ class Ext2Ego:
     single per-frame process() call.
     """
 
-    def __init__(self, rgbd: RGBDData, tracker: ArucoTracker, config_path: str):
-        self.rgbd    = rgbd
-        self.tracker = tracker
+    def __init__(self, rgbd: RGBDData, tracker: ArucoTracker, config_path: str,
+                 segmentation: Segmentation | None = None):
+        self.rgbd         = rgbd
+        self.tracker      = tracker
+        self.segmentation = segmentation
         self.T_cw: np.ndarray | None = None
 
         with open(config_path, "r") as f:
@@ -271,24 +274,29 @@ class Ext2Ego:
             occlusion: If False, skip occlusion culling (faster, useful for testing).
 
         Returns (visible_points, det) where visible_points is an (M, 6) xyzrgb
-        array in ego camera frame, and det is the MarkerDetection used to derive
-        the ego camera pose (None if the marker was not found).
+        or (M, 7) xyzrgb+seg_id array in ego camera frame, and det is the
+        MarkerDetection used to derive the ego camera pose (None if not found).
         """
-        pc  = self.rgbd.get_pointcloud(index)   # (N, 6) xyzrgb
+        rgb, _    = self.rgbd.get_frame(index)
+        label_map = self.segmentation.segment(rgb) if self.segmentation is not None else None
+
+        pc  = self.rgbd.get_pointcloud(index, label_map=label_map)  # (N,6) or (N,7)
         det = self.tracker.detect_plane(index)
-        self.tracker.plot_pointcloud_with_marker(index)
+
+        self.rgbd.plot_pointcloud(index, label_map = label_map)
+        n_extra = pc.shape[1] - 6  # 0 without seg, 1 with
         if det is None:
-            return np.empty((0, 6), dtype=np.float32), None
+            return np.empty((0, 6 + n_extra), dtype=np.float32), None
 
         R, t = self.tracker.get_camera_pose(det)
         self.set_pose(R, t)
 
-        xyz_cam             = self.transform(pc[:, :3])
-        _, frustum_mask     = self.filter_frustum(xyz_cam)
+        xyz_cam         = self.transform(pc[:, :3])
+        _, frustum_mask = self.filter_frustum(xyz_cam)
 
-        xyz_frustum = xyz_cam[frustum_mask]
-        rgb_frustum = pc[frustum_mask, 3:]
-        result      = np.concatenate([xyz_frustum, rgb_frustum], axis=1)
+        xyz_frustum   = xyz_cam[frustum_mask]
+        extra_frustum = pc[frustum_mask, 3:]          # rgb (+ seg_id if present)
+        result        = np.concatenate([xyz_frustum, extra_frustum], axis=1)
 
         if occlusion:
             _, occ_mask = self.cull_occlusion(xyz_frustum)
@@ -301,7 +309,8 @@ def main():
     print("Hello from ext-to-ego!")
     data = RGBDData('data/run_6_high_accuracy')
     tracker = ArucoTracker(data)
-    pipeline = Ext2Ego(data, tracker, 'config/camera.yaml')
+    seg = Segmentation()
+    pipeline = Ext2Ego(data, tracker, 'config/camera.yaml', seg)
     pts, det = pipeline.process(150)
     plot_pc(pts)
 
