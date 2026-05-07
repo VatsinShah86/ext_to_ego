@@ -321,8 +321,10 @@ class ArucoTracker:
         x_axis /= np.linalg.norm(x_axis)
         y_axis = np.cross(normal, x_axis)
         y_axis /= np.linalg.norm(y_axis)
+        z_axis = np.cross(x_axis, y_axis)   # enforce right-handed: Z = X × Y
+        z_axis /= np.linalg.norm(z_axis)
 
-        R_plane = np.column_stack([x_axis, y_axis, normal])
+        R_plane = np.column_stack([x_axis, y_axis, z_axis])
         rvec_plane, _ = cv2.Rodrigues(R_plane)
 
         return MarkerDetection(
@@ -333,6 +335,16 @@ class ArucoTracker:
             rvec=rvec_plane.flatten(),
             tvec=centroid,
         )
+
+    def debug_frame(self, det: MarkerDetection) -> None:
+        """Print orthogonality and handedness diagnostics for a MarkerDetection frame."""
+        R, _ = cv2.Rodrigues(det.rvec)
+        x, y, z = R[:, 0], R[:, 1], R[:, 2]
+        print(f"  |x|={np.linalg.norm(x):.6f}  |y|={np.linalg.norm(y):.6f}  |z|={np.linalg.norm(z):.6f}  (all should be 1)")
+        print(f"  x·y={np.dot(x,y):.6f}  x·z={np.dot(x,z):.6f}  y·z={np.dot(y,z):.6f}  (all should be 0)")
+        cross_xy = np.cross(x, y)
+        print(f"  det(R)={np.linalg.det(R):.6f}  (should be +1)")
+        print(f"  x×y≈z: {np.allclose(cross_xy, z, atol=1e-4)}  max_err={np.max(np.abs(cross_xy - z)):.2e}")
 
     def plot_frame(self, index: int) -> None:
         """Plot color image and depth map for *index* with the detected marker overlaid."""
@@ -468,8 +480,8 @@ if __name__ == "__main__":
     # for i in range (10):
     #     data.plot_pointcloud(3*i)
 
-    data.plot_frame(0)
-    data.plot_pointcloud(0, 300000)
+    data.plot_frame(30)
+    # data.plot_pointcloud(0, 300000)
     # aruco_tracker = ArucoTracker(data)
     # aruco_tracker.plot_frame(500)
     # data.plot_pointcloud(0, 100000)

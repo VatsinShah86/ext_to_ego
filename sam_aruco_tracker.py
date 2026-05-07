@@ -205,8 +205,8 @@ class ArucoSAMTracker:
 
 
 if __name__ == "__main__":
-    data = RGBDData("data/raw_camera_data_2")
-    image_rgb, _ = data.get_frame(400)
+    data = RGBDData("data/run_6_high_accuracy")
+    image_rgb, _ = data.get_frame(30)
 
     # tracker = ArucoSAMTracker()
     # corners = tracker.extract_marker(image_rgb, marker_x=365, marker_y=164)

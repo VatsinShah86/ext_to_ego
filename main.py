@@ -302,7 +302,7 @@ def main():
     data = RGBDData('data/run_6_high_accuracy')
     tracker = ArucoTracker(data)
     pipeline = Ext2Ego(data, tracker, 'config/camera.yaml')
-    pts, det = pipeline.process(1)
+    pts, det = pipeline.process(150)
     plot_pc(pts)
 
 
