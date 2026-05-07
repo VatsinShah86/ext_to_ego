@@ -17,7 +17,7 @@ class DepthCamera:
         # Get depth scale of the device
         self.depth_scale =  depth_sensor.get_depth_scale()
             # Create an align object
-        align_to = rs.stream.depth
+        align_to = rs.stream.color
 
         self.align = rs.align(align_to)
         device_product_line = str(device.get_info(rs.camera_info.product_line))
@@ -26,7 +26,12 @@ class DepthCamera:
         config.enable_stream(rs.stream.color,  resolution_width,  resolution_height, rs.format.bgr8, 30)
         
         # Start streaming
-        self.pipeline.start(config)
+        profile = self.pipeline.start(config)
+        
+        # Set depth sensor to high accuracy preset for better quality
+        depth_sensor = profile.get_device().first_depth_sensor()
+        depth_sensor.set_option(rs.option.visual_preset, 3)  # 3 = High Accuracy preset
+        print("RealSense configured for high accuracy mode")
         
         # Warmup: read frames until we get valid non-empty point clouds
         print("Warming up camera...")

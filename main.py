@@ -299,10 +299,10 @@ class Ext2Ego:
 
 def main():
     print("Hello from ext-to-ego!")
-    data = RGBDData('data/raw_camera_data_2')
+    data = RGBDData('data/run_6_high_accuracy')
     tracker = ArucoTracker(data)
     pipeline = Ext2Ego(data, tracker, 'config/camera.yaml')
-    pts, det = pipeline.process(400)
+    pts, det = pipeline.process(1)
     plot_pc(pts)
 
 

@@ -463,13 +463,13 @@ class ArucoTracker:
         plt.show()
 
 if __name__ == "__main__":
-    data = RGBDData("data/run_2")
+    data = RGBDData("data/run_6_high_accuracy")
 
     # for i in range (10):
     #     data.plot_pointcloud(3*i)
 
     data.plot_frame(0)
-    data.plot_pointcloud(0)
+    data.plot_pointcloud(0, 300000)
     # aruco_tracker = ArucoTracker(data)
     # aruco_tracker.plot_frame(500)
     # data.plot_pointcloud(0, 100000)

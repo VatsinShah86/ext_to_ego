@@ -7,7 +7,6 @@ wheels/
 *.egg-info
 *.png
 *.pth
-data/
 .DS_Store
 
 # Virtual environments
