@@ -39,7 +39,16 @@ config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
 # Start streaming
 profile = pipeline.start(config)
+spatial = rs.spatial_filter()
+spatial.set_option(rs.option.filter_magnitude, 2)
+spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+spatial.set_option(rs.option.filter_smooth_delta, 20)
 
+temporal = rs.temporal_filter()
+temporal.set_option(rs.option.filter_smooth_alpha, 0.1)
+temporal.set_option(rs.option.filter_smooth_delta, 40)
+
+hole_filling = rs.hole_filling_filter()
 # Getting the depth sensor's depth scale (see rs-align example for explanation)
 depth_sensor = profile.get_device().first_depth_sensor()
 depth_scale = depth_sensor.get_depth_scale()
@@ -70,6 +79,9 @@ try:
         aligned_depth_frame = aligned_frames.get_depth_frame() # aligned_depth_frame is a 640x480 depth image
         color_frame = aligned_frames.get_color_frame()
 
+        aligned_depth_frame = spatial.process(aligned_depth_frame)
+        aligned_depth_frame = temporal.process(aligned_depth_frame)
+        aligned_depth_frame = hole_filling.process(aligned_depth_frame)
         # Validate that both frames are valid
         if not aligned_depth_frame or not color_frame:
             continue

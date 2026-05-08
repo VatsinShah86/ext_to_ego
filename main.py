@@ -307,11 +307,12 @@ class Ext2Ego:
 
 def main():
     print("Hello from ext-to-ego!")
-    data = RGBDData('data/run_6_high_accuracy')
+    data = RGBDData('data/run_15_high_accuracy')
     tracker = ArucoTracker(data)
     seg = Segmentation()
     pipeline = Ext2Ego(data, tracker, 'config/camera.yaml', seg)
-    pts, det = pipeline.process(150)
+    pts, det = pipeline.process(500)
+    print(f"Visible points shape: {pts.shape}")
     plot_pc(pts)
 
 

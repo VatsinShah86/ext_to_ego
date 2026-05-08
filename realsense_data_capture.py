@@ -37,16 +37,16 @@ class DepthCamera:
         # self.decimation = rs.decimation_filter()
         # self.decimation.set_option(rs.option.filter_magnitude, 2)
 
-        self.spatial = rs.spatial_filter()
-        self.spatial.set_option(rs.option.filter_magnitude, 2)
-        self.spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
-        self.spatial.set_option(rs.option.filter_smooth_delta, 20)
+        # self.spatial = rs.spatial_filter()
+        # self.spatial.set_option(rs.option.filter_magnitude, 2)
+        # self.spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
+        # self.spatial.set_option(rs.option.filter_smooth_delta, 20)
 
         self.temporal = rs.temporal_filter()
         self.temporal.set_option(rs.option.filter_smooth_alpha, 0.1)
         self.temporal.set_option(rs.option.filter_smooth_delta, 40)
 
-        # self.hole_filling = rs.hole_filling_filter()
+        self.hole_filling = rs.hole_filling_filter()
         # Warmup: read frames until we get valid non-empty point clouds
         print("Warming up camera...")
         # max_warmup_attempts = 30
@@ -80,9 +80,9 @@ class DepthCamera:
         
         # Apply filter pipeline to depth only
         # depth_frame = self.decimation.process(depth_frame)
-        depth_frame = self.spatial.process(depth_frame)
+        # depth_frame = self.spatial.process(depth_frame)
         depth_frame = self.temporal.process(depth_frame)
-        # depth_frame = self.hole_filling.process(depth_frame)
+        depth_frame = self.hole_filling.process(depth_frame)
 
         return True, depth_frame, color_frame
     

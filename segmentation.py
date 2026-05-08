@@ -12,7 +12,7 @@ class Segmentation:
     """
 
     def __init__(self, model_path: str = "sam2.1_b.pt"):
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
         self.model = SAM(model_path)
         self.model.to(self.device)
 
@@ -75,7 +75,7 @@ class Segmentation:
 if __name__ == "__main__":
     from vision import RGBDData
 
-    data = RGBDData("data/run_6_high_accuracy")
+    data = RGBDData("data/run_7_high_accuracy")
 
     rgb, _ = data.get_frame(0)
 
