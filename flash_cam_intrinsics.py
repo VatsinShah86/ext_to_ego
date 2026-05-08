@@ -97,7 +97,7 @@ def flash_calibration(calibration_path: str):
     print("\nCalibration successfully written to camera EEPROM.")
     print("Restart your pipeline to verify the new intrinsics are returned.")
 
-def check_calibration():
+def check_calibration(calibration_path: str):
     import json
 
     cal = np.load(calibration_path)
@@ -126,4 +126,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--calibration", required=True, help="Path to calibration.npz")
     args = parser.parse_args()
-    flash_calibration(args.calibration)
+    # flash_calibration(args.calibration)
+    check_calibration(args.calibration)

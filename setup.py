@@ -12,8 +12,10 @@ setup(
         "opencv-python>=4.13.0.92",
         "pyyaml>=6.0.3",
         "scipy>=1.17.1",
+        "torch>=2.0.0",
+        "ultralytics>=8.4.47",
         "zarr>=3.0.0",
-        "pyrealsense2>=2.66.0",
+        "pyrealsense2>=2.57.7.10387",
     ],
     packages=find_packages(),
 )
