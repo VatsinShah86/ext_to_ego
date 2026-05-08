@@ -56,13 +56,24 @@ while True:
 
 cv2.destroyAllWindows()
 camera.release()
-ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
-    charucoCorners=all_charuco_corners,
-    charucoIds=all_charuco_ids,
-    board=board,
-    imageSize=image_size,
-    cameraMatrix=None,
-    distCoeffs=None
+
+obj_points = []
+img_points = []
+
+for corners, ids in zip(all_charuco_corners, all_charuco_ids):
+    # matchImagePoints maps the detected charuco corners to their
+    # corresponding 3D object points on the board
+    obj_pts, img_pts = board.matchImagePoints(corners, ids)
+    if obj_pts is not None and len(obj_pts) >= 4:
+        obj_points.append(obj_pts)
+        img_points.append(img_pts)
+
+ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+    obj_points,
+    img_points,
+    image_size,
+    None,
+    None
 )
 
 print(f"Calibration RMS error: {ret:.4f} px")  # good if < 1.0
