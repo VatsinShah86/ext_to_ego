@@ -97,6 +97,30 @@ def flash_calibration(calibration_path: str):
     print("\nCalibration successfully written to camera EEPROM.")
     print("Restart your pipeline to verify the new intrinsics are returned.")
 
+def check_calibration():
+    import json
+
+    cal = np.load(calibration_path)
+    camera_matrix = cal['camera_matrix']
+    dist_coeffs = cal['dist_coeffs'].flatten()
+    rms = float(cal['rms_error'])
+    print(f"Loaded calibration (RMS: {rms:.4f}px)")
+
+    # Connect to device
+    ctx = rs.context()
+    device = ctx.query_devices()[0]
+    print(f"Connected to: {device.get_info(rs.camera_info.name)}")
+
+    auto_cal = device.as_auto_calibrated_device()
+
+    # Get current calibration table (returned as JSON string)
+    table = auto_cal.get_calibration_table()
+    print("Current calibration table:")
+    print(table)
+
+    # Inspect what keys are available before patching
+    table_dict = json.loads(table)
+    print("\nCalibration table keys:", list(table_dict.keys()))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
