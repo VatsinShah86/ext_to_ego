@@ -19,9 +19,17 @@ class RGBDData:
         # Load depth and color intrinsics from updated metadata
         self.depth_intrinsics: dict = meta["depth_intrinsics"].item()  # fx, fy, ppx, ppy, width, height, etc.
         self.color_intrinsics: dict = meta["color_intrinsics"].item()
-        
+
         # For backward compatibility with code that uses self.intrinsics, use depth_intrinsics
         self.intrinsics: dict = self.depth_intrinsics
+
+        intr = self.depth_intrinsics
+        self.camera_matrix = np.array([
+            [intr["fx"],  0.,          intr["ppx"]],
+            [0.,          intr["fy"],  intr["ppy"]],
+            [0.,          0.,          1.         ],
+        ], dtype=np.float64)
+        self.dist_coeffs = np.array(intr["coeffs"], dtype=np.float64)
         
         print(f"depth_scale: {self.depth_scale}")
         print(f"depth_intrinsics: {self.depth_intrinsics}")
@@ -63,18 +71,17 @@ class RGBDData:
         """
         color_rgb, depth_m = self.get_frame(index)
 
-        fx = self.intrinsics["fx"]
-        fy = self.intrinsics["fy"]
-        cx = self.intrinsics["ppx"]
-        cy = self.intrinsics["ppy"]
-
         h, w = depth_m.shape
         uu, vv = np.meshgrid(np.arange(w, dtype=np.float32),
                              np.arange(h, dtype=np.float32))
 
+        # Undistort pixel grid → normalized camera coordinates, then lift to 3D
+        pts = np.stack([uu.ravel(), vv.ravel()], axis=-1).reshape(-1, 1, 2)
+        pts_norm = cv2.undistortPoints(pts, self.camera_matrix, self.dist_coeffs).reshape(h, w, 2)
+
         z = depth_m
-        x = (uu - cx) * z / fx
-        y = (vv - cy) * z / fy
+        x = pts_norm[..., 0] * z
+        y = pts_norm[..., 1] * z
 
         valid = (z > 0) & (z <= max_z)
         xyz = np.stack([x, y, z], axis=-1)[valid]
@@ -177,7 +184,7 @@ class ArucoTracker:
             [0.,          intr["fy"],  intr["ppy"]],
             [0.,          0.,          1.         ],
         ], dtype=np.float64)
-        self.dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+        self.dist_coeffs = rgbd.dist_coeffs.reshape(-1, 1)
 
         # 3D corners in marker space [TL, TR, BR, BL], Y-up as required by IPPE_SQUARE
         h = marker_size_m / 2
@@ -264,13 +271,10 @@ class ArucoTracker:
         # slide tvec along the marker normal until it agrees with the back-projected depth centre.
         valid = depth_samples[depth_samples > 0]
         if len(valid):
-            intr = self.rgbd.intrinsics
             z = float(valid.mean())
-            p_depth = np.array([
-                (float(center[0]) - intr["ppx"]) * z / intr["fx"],
-                (float(center[1]) - intr["ppy"]) * z / intr["fy"],
-                z,
-            ])
+            center_pt = np.array([[[float(center[0]), float(center[1])]]], dtype=np.float64)
+            center_norm = cv2.undistortPoints(center_pt, self.camera_matrix, self.dist_coeffs).flatten()
+            p_depth = np.array([center_norm[0] * z, center_norm[1] * z, z])
             R, _ = cv2.Rodrigues(rvec)
             marker_normal = R[:, 2]
             tvec = tvec + float(marker_normal @ (p_depth - tvec)) * marker_normal
@@ -299,9 +303,6 @@ class ArucoTracker:
 
         depth_frame = self.rgbd.depth_frames[index]
         h_img, w_img = depth_frame.shape
-        intr = self.rgbd.intrinsics
-        fx, fy = intr["fx"], intr["fy"]
-        ppx, ppy = intr["ppx"], intr["ppy"]
 
         # Rasterise the 4 boundary edges
         mask = np.zeros((h_img, w_img), dtype=np.uint8)
@@ -316,7 +317,9 @@ class ArucoTracker:
             return det  # not enough depth readings — fall back
 
         xs, ys, z = xs[valid].astype(np.float64), ys[valid].astype(np.float64), z[valid]
-        pts3d = np.stack([(xs - ppx) * z / fx, (ys - ppy) * z / fy, z], axis=1)
+        pts_2d = np.stack([xs, ys], axis=-1).reshape(-1, 1, 2)
+        pts_norm = cv2.undistortPoints(pts_2d, self.camera_matrix, self.dist_coeffs).reshape(-1, 2)
+        pts3d = np.stack([pts_norm[:, 0] * z, pts_norm[:, 1] * z, z], axis=1)
 
         # Fit plane via SVD — last right-singular vector is the plane normal
         centroid = pts3d.mean(axis=0)
@@ -330,7 +333,11 @@ class ArucoTracker:
             cx, cy = det.corners[corner_idx]
             ci, ri = int(np.clip(cx, 0, w_img - 1)), int(np.clip(cy, 0, h_img - 1))
             d = depth_frame[ri, ci].astype(float) * self.rgbd.depth_scale
-            return np.array([(cx - ppx) * d / fx, (cy - ppy) * d / fy, d]) if d > 0 else None
+            if d <= 0:
+                return None
+            pt = np.array([[[float(cx), float(cy)]]], dtype=np.float64)
+            norm = cv2.undistortPoints(pt, self.camera_matrix, self.dist_coeffs).flatten()
+            return np.array([norm[0] * d, norm[1] * d, d])
 
         p_TL, p_TR = backproject(0), backproject(1)
         if p_TL is not None and p_TR is not None:

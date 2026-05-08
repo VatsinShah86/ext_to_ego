@@ -254,6 +254,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pyyaml" },
     { name = "scipy" },
+    { name = "torch" },
     { name = "ultralytics" },
     { name = "zarr" },
 ]
@@ -265,6 +266,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.13.0.92" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scipy", specifier = ">=1.17.1" },
+    { name = "torch", specifier = ">=2.0.0" },
     { name = "ultralytics", specifier = ">=8.4.47" },
     { name = "zarr", specifier = ">=3.0.0" },
 ]
