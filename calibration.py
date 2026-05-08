@@ -5,6 +5,11 @@ import numpy as np
 # Reuse your DepthCamera class
 from realsense_data_capture import DepthCamera
 
+SQUARES_X = 7        # number of chessboard squares horizontally
+SQUARES_Y = 5        # number of chessboard squares vertically
+SQUARE_SIZE = 0.0215   # meters — measure this on your printout with a ruler
+MARKER_SIZE = 0.016   # meters — must be < SQUARE_SIZE
+
 camera = DepthCamera(640,480)
 dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
 board = cv2.aruco.CharucoBoard(
@@ -71,11 +76,14 @@ np.savez("calibration.npz",
     rms_error=ret
 )
 
-# RS2 intrinsics from your existing metadata
-rs2_fx = metadata['color_intrinsics']['fx']
-rs2_fy = metadata['color_intrinsics']['fy']
-rs2_ppx = metadata['color_intrinsics']['ppx']
-rs2_ppy = metadata['color_intrinsics']['ppy']
+# Load RS2 intrinsics from recorded metadata
+metadata = np.load("data/run_6_high_accuracy/metadata.npz", allow_pickle=True)
+color_intrinsics = metadata['color_intrinsics'].item()  # Extract dict from numpy array
+
+rs2_fx = color_intrinsics['fx']
+rs2_fy = color_intrinsics['fy']
+rs2_ppx = color_intrinsics['ppx']
+rs2_ppy = color_intrinsics['ppy']
 
 print("         fx      fy      cx      cy")
 print(f"RS2:  {rs2_fx:.1f}  {rs2_fy:.1f}  {rs2_ppx:.1f}  {rs2_ppy:.1f}")
