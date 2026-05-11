@@ -61,6 +61,8 @@ class Segmentation:
             List of N (H, W) int32 label maps.  IDs match those assigned by
             segment() on frame 0; background = 0.
         """
+        import os
+        import tempfile
         from PIL import Image
 
         if self._video_predictor is None:
@@ -78,31 +80,34 @@ class Segmentation:
         N, H, W = frames.shape[:3]
 
         # Everything-mode on frame 0 — provides initial masks for all objects
-        label_map_0  = self.segment(frames[0])
-        unique_ids   = np.unique(label_map_0)
-        unique_ids   = unique_ids[unique_ids > 0]   # drop background
+        label_map_0 = self.segment(frames[0])
+        unique_ids  = np.unique(label_map_0)
+        unique_ids  = unique_ids[unique_ids > 0]   # drop background
 
-        pil_frames  = [Image.fromarray(f) for f in frames]
-        label_maps  = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
+        label_maps    = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
         label_maps[0] = label_map_0
 
-        with torch.inference_mode():
-            state = self._video_predictor.init_state(video_path=pil_frames)
+        # SAM2 video predictor requires a JPEG folder — write frames to a temp dir
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, frame in enumerate(frames):
+                Image.fromarray(frame).save(os.path.join(tmpdir, f"{i:05d}.jpg"))
 
-            for obj_id in unique_ids:
-                mask = label_map_0 == obj_id
-                self._video_predictor.add_new_mask(
-                    state, frame_idx=0, obj_id=int(obj_id), mask=mask
-                )
+            with torch.inference_mode():
+                state = self._video_predictor.init_state(video_path=tmpdir)
 
-            # propagate_in_video skips frame 0 (already initialised above)
-            for frame_idx, obj_ids, mask_logits in \
-                    self._video_predictor.propagate_in_video(state):
-                masks = (mask_logits > 0.0).cpu().numpy()  # (N_obj, 1, H, W)
-                lm = np.zeros((H, W), dtype=np.int32)
-                for obj_id, m in zip(obj_ids, masks):
-                    lm[m[0]] = int(obj_id)
-                label_maps[frame_idx] = lm
+                for obj_id in unique_ids:
+                    mask = label_map_0 == obj_id
+                    self._video_predictor.add_new_mask(
+                        state, frame_idx=0, obj_id=int(obj_id), mask=mask
+                    )
+
+                for frame_idx, obj_ids, mask_logits in \
+                        self._video_predictor.propagate_in_video(state):
+                    masks = (mask_logits > 0.0).cpu().numpy()  # (N_obj, 1, H, W)
+                    lm = np.zeros((H, W), dtype=np.int32)
+                    for obj_id, m in zip(obj_ids, masks):
+                        lm[m[0]] = int(obj_id)
+                    label_maps[frame_idx] = lm
 
         return label_maps
 
