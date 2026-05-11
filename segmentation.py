@@ -87,13 +87,23 @@ class Segmentation:
         label_maps    = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
         label_maps[0] = label_map_0
 
+        # Free the Ultralytics SAM model from GPU before the video predictor
+        # runs — both models loaded simultaneously would exhaust VRAM.
+        self.model.to("cpu")
+        torch.cuda.empty_cache()
+
         # SAM2 video predictor requires a JPEG folder — write frames to a temp dir
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, frame in enumerate(frames):
                 Image.fromarray(frame).save(os.path.join(tmpdir, f"{i:05d}.jpg"))
 
             with torch.inference_mode():
-                state = self._video_predictor.init_state(video_path=tmpdir)
+                # offload_state_to_cpu keeps per-frame encoder features in CPU RAM
+                # rather than accumulating them all on GPU (would exhaust VRAM for
+                # long episodes).
+                state = self._video_predictor.init_state(
+                    video_path=tmpdir, offload_state_to_cpu=True
+                )
 
                 for obj_id in unique_ids:
                     mask = label_map_0 == obj_id
@@ -109,6 +119,7 @@ class Segmentation:
                         lm[m[0]] = int(obj_id)
                     label_maps[frame_idx] = lm
 
+        self.model.to(self.device)
         return label_maps
 
     def segment_with_bbox(self, image_rgb: np.ndarray, bbox: np.ndarray) -> np.ndarray:
