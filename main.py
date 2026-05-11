@@ -353,7 +353,6 @@ class Ext2Ego:
 
         prev_det = None
         for index in range(N):
-            print(f"Processing index {index}")
             label_map = label_maps[index]
 
             pc  = self.rgbd.get_pointcloud(index, label_map=label_map)  # (N,6) or (N,7)
