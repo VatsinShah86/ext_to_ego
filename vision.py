@@ -1,3 +1,4 @@
+import json
 import os
 import cv2
 import numpy as np
@@ -8,21 +9,90 @@ import time
 from dataclasses import dataclass
 
 class RGBDData:
-    """Handles multi-frame RGBD data collected from a RealSense camera."""
+    """Handles multi-frame RGBD data collected from a RealSense camera.
+
+    Supports two on-disk formats detected automatically:
+      - Old format: metadata.npz + color_raw.zarr + depth_raw.zarr
+        Depth stored as raw uint16; multiplied by depth_scale → metres in get_frame().
+      - New format: zarr group with metadata.json + images/rgb + images/depth
+        Depth stored as float32 already in metres; depth_scale is 1.0.
+        Requires calibration fields in metadata.json (run update_metadata.py first).
+    """
 
     def __init__(self, folder: str):
+        folder = folder.rstrip("/\\")
+        if os.path.exists(os.path.join(folder, "metadata.json")):
+            self._load_new_format(folder)
+        elif os.path.exists(os.path.join(folder, "metadata.npz")):
+            self._load_old_format(folder)
+        else:
+            raise FileNotFoundError(
+                f"No metadata.json or metadata.npz found in {folder}"
+            )
+
+        if self.color_frames.shape[0] != self.depth_frames.shape[0]:
+            raise ValueError(
+                f"Frame count mismatch: color has {self.color_frames.shape[0]}, "
+                f"depth has {self.depth_frames.shape[0]}"
+            )
+
+    # ── format loaders ────────────────────────────────────────────────────
+
+    def _load_old_format(self, folder: str) -> None:
         meta = np.load(os.path.join(folder, "metadata.npz"), allow_pickle=True)
-        self.depth_scale: float = float(meta["depth_scale"])
-        self.timestamps: np.ndarray = meta["timestamps"]
-        self.recording_time: str = str(meta["recording_time"])
-        
-        # Load depth and color intrinsics from updated metadata
-        self.depth_intrinsics: dict = meta["depth_intrinsics"].item()  # fx, fy, ppx, ppy, width, height, etc.
-        self.color_intrinsics: dict = meta["color_intrinsics"].item()
+        self.depth_scale: float       = float(meta["depth_scale"])
+        self.timestamps: np.ndarray   = meta["timestamps"]
+        self.recording_time: str      = str(meta["recording_time"])
+        self.depth_intrinsics: dict   = meta["depth_intrinsics"].item()
+        self.color_intrinsics: dict   = meta["color_intrinsics"].item()
+        self.intrinsics: dict         = self.depth_intrinsics
 
-        # For backward compatibility with code that uses self.intrinsics, use depth_intrinsics
-        self.intrinsics: dict = self.depth_intrinsics
+        self._build_camera_model()
 
+        print(f"[old format] depth_scale={self.depth_scale}")
+        print(f"  depth_intrinsics: {self.depth_intrinsics}")
+
+        color_zarr = zarr.open_array(os.path.join(folder, "color_raw.zarr"), mode='r')
+        depth_zarr = zarr.open_array(os.path.join(folder, "depth_raw.zarr"), mode='r')
+        self.color_frames: np.ndarray = np.asarray(color_zarr)[..., ::-1]  # BGR → RGB
+        self.depth_frames: np.ndarray = np.asarray(depth_zarr)
+
+    def _load_new_format(self, folder: str) -> None:
+        with open(os.path.join(folder, "metadata.json"), 'r') as f:
+            meta = json.load(f)
+
+        if "depth_intrinsics" not in meta:
+            raise ValueError(
+                f"Calibration fields missing from metadata.json in {folder}.\n"
+                "Run:  python update_metadata.py <folder>  (or --all data/)"
+            )
+
+        fps         = float(meta["fps"])
+        frame_count = int(meta["frame_count"])
+
+        # Depth is pre-converted to metres; no further scaling needed.
+        self.depth_scale: float       = 1.0
+        self.recording_time: str      = meta.get("start_time", "")
+        self.timestamps: np.ndarray   = np.arange(frame_count, dtype=np.float64) / fps
+        self.depth_intrinsics: dict   = meta["depth_intrinsics"]
+        self.color_intrinsics: dict   = meta["color_intrinsics"]
+        self.intrinsics: dict         = self.depth_intrinsics
+
+        self._build_camera_model()
+
+        print(f"[new format] fps={fps}  frames={frame_count}")
+        print(f"  depth_intrinsics: {self.depth_intrinsics}")
+
+        root       = zarr.open(folder, mode='r')
+        rgb_zarr   = root["images"]["rgb"]    # (N, H, W, 3) uint8
+        depth_zarr = root["images"]["depth"]  # (N, H, W)    float32, metres
+
+        color_raw = np.asarray(rgb_zarr)
+        color_fmt = meta.get("color_format", "RGB").upper()
+        self.color_frames: np.ndarray = color_raw[..., ::-1] if color_fmt == "BGR" else color_raw
+        self.depth_frames: np.ndarray = np.asarray(depth_zarr)
+
+    def _build_camera_model(self) -> None:
         intr = self.depth_intrinsics
         self.camera_matrix = np.array([
             [intr["fx"],  0.,          intr["ppx"]],
@@ -30,24 +100,6 @@ class RGBDData:
             [0.,          0.,          1.         ],
         ], dtype=np.float64)
         self.dist_coeffs = np.array(intr["coeffs"], dtype=np.float64)
-        
-        print(f"depth_scale: {self.depth_scale}")
-        print(f"depth_intrinsics: {self.depth_intrinsics}")
-        print(f"color_intrinsics: {self.color_intrinsics}")
-        
-        # Load from zarr (zarr doesn't support negative step slicing, so load to numpy first)
-        color_zarr = zarr.open_array(os.path.join(folder, "color_raw.zarr"), mode='r')
-        depth_zarr = zarr.open_array(os.path.join(folder, "depth_raw.zarr"), mode='r')
-        
-        # Load to numpy arrays and convert BGR to RGB
-        self.color_frames: np.ndarray = np.asarray(color_zarr)[..., ::-1]  # Convert BGR to RGB
-        self.depth_frames: np.ndarray = np.asarray(depth_zarr)
-
-        if self.color_frames.shape[0] != self.depth_frames.shape[0]:
-            raise ValueError(
-                f"Frame count mismatch: color has {self.color_frames.shape[0]}, "
-                f"depth has {self.depth_frames.shape[0]}"
-            )
 
     @property
     def num_frames(self) -> int:
@@ -365,6 +417,96 @@ class ArucoTracker:
             tvec=centroid,
         )
 
+    def detect_plane_from_mask(
+        self, index: int, mask: np.ndarray, prev_det: "MarkerDetection"
+    ) -> "MarkerDetection | None":
+        """Fit a plane to back-projected pixels inside a SAM mask.
+
+        Mirrors detect_plane() but operates on the full set of valid-depth pixels
+        inside *mask* instead of ArUco boundary pixels.  prev_det.angle_deg seeds
+        the in-plane X-axis so the coordinate frame is consistent with the last
+        good ArUco detection.
+
+        Args:
+            index:    Frame index into self.rgbd.
+            mask:     (H, W) bool array — True pixels are the marker region.
+            prev_det: Last successful MarkerDetection (for angle hint).
+
+        Returns:
+            MarkerDetection with SVD-fitted pose, or None if < 6 valid depth pixels.
+        """
+        depth_frame = self.rgbd.depth_frames[index]
+        h_img, w_img = depth_frame.shape
+
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            return None
+
+        z = depth_frame[ys, xs].astype(np.float64) * self.rgbd.depth_scale
+        valid = z > 0
+        if valid.sum() < 6:
+            return None
+
+        xs_v = xs[valid].astype(np.float64)
+        ys_v = ys[valid].astype(np.float64)
+        z_v  = z[valid]
+
+        pts_2d  = np.stack([xs_v, ys_v], axis=-1).reshape(-1, 1, 2)
+        pts_norm = cv2.undistortPoints(pts_2d, self.camera_matrix, self.dist_coeffs).reshape(-1, 2)
+        pts3d   = np.stack([pts_norm[:, 0] * z_v, pts_norm[:, 1] * z_v, z_v], axis=1)
+
+        # SVD plane fit
+        centroid = pts3d.mean(axis=0)
+        _, _, Vt = np.linalg.svd(pts3d - centroid, full_matrices=False)
+        normal = Vt[-1]
+        if normal[2] > 0:
+            normal = -normal
+
+        # In-plane X-axis: project prev_det's angle direction onto the plane
+        angle_rad = np.radians(prev_det.angle_deg)
+        x_cand = np.array([np.cos(angle_rad), np.sin(angle_rad), 0.0])
+        x_axis = x_cand - np.dot(x_cand, normal) * normal
+        norm_x = np.linalg.norm(x_axis)
+        if norm_x < 1e-6:
+            x_axis = np.array([1., 0., 0.])
+            x_axis = x_axis - np.dot(x_axis, normal) * normal
+            x_axis /= np.linalg.norm(x_axis)
+        else:
+            x_axis /= norm_x
+        y_axis = np.cross(normal, x_axis)
+        y_axis /= np.linalg.norm(y_axis)
+        z_axis = np.cross(x_axis, y_axis)
+        z_axis /= np.linalg.norm(z_axis)
+
+        R_plane = np.column_stack([x_axis, y_axis, z_axis])
+        rvec_plane, _ = cv2.Rodrigues(R_plane)
+
+        # 2D center from mask pixel centroid
+        center_2d = np.array([xs_v.mean(), ys_v.mean()], dtype=np.float32)
+
+        # Bounding-box corners (used only for display; not load-bearing for pose)
+        corners = np.array([
+            [xs_v.min(), ys_v.min()],
+            [xs_v.max(), ys_v.min()],
+            [xs_v.max(), ys_v.max()],
+            [xs_v.min(), ys_v.max()],
+        ], dtype=np.float32)
+        cpts = np.round(corners).astype(int)
+        cpts[:, 0] = np.clip(cpts[:, 0], 0, w_img - 1)
+        cpts[:, 1] = np.clip(cpts[:, 1], 0, h_img - 1)
+        depth_samples = (
+            depth_frame[cpts[:, 1], cpts[:, 0]].astype(np.float32) * self.rgbd.depth_scale
+        )
+
+        return MarkerDetection(
+            corners=corners,
+            center=center_2d,
+            angle_deg=prev_det.angle_deg,
+            depth_samples=depth_samples,
+            rvec=rvec_plane.flatten(),
+            tvec=centroid,
+        )
+
     def debug_frame(self, det: MarkerDetection) -> None:
         """Print orthogonality and handedness diagnostics for a MarkerDetection frame."""
         R, _ = cv2.Rodrigues(det.rvec)
@@ -504,14 +646,14 @@ class ArucoTracker:
         plt.show()
 
 if __name__ == "__main__":
-    data = RGBDData("data/run_6_high_accuracy")
+    data = RGBDData("data/episode_20260507_231138.zarr")
 
     # for i in range (10):
     #     data.plot_pointcloud(3*i)
 
-    data.plot_frame(30)
+    # data.plot_frame(30)
     # data.plot_pointcloud(0, 300000)
-    # aruco_tracker = ArucoTracker(data)
+    aruco_tracker = ArucoTracker(data)
     # aruco_tracker.plot_frame(500)
     # data.plot_pointcloud(0, 100000)
     # start_ns = time.perf_counter_ns()
@@ -519,4 +661,15 @@ if __name__ == "__main__":
     # elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
     # print(f"detect(500) took {elapsed_ms:.3f} ms")
     
-    # aruco_tracker.plot_pointcloud_with_marker(0, 0.5)
+    # aruco_tracker.plot_pointcloud_with_marker(500, 0.5)
+    num_frames = data.num_frames
+    print(f"total frames: {num_frames}")
+    bad_det = 0
+    for i in range(num_frames):
+        det_plane = aruco_tracker.detect_plane(i)
+        if det_plane is None:
+            print(f"frame {i} has no aruco detected")
+            data.plot_frame(i)
+            bad_det+=1
+        
+    print(f"{bad_det} frames have no aruco markers")

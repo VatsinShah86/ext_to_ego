@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
     "pyyaml>=6.0.3",
+    "sam2>=1.1.0",
     "scipy>=1.17.1",
     "torch>=2.0.0",
     "ultralytics>=8.4.47",

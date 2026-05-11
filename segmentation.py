@@ -11,10 +11,19 @@ class Segmentation:
     Images are expected as (H, W, 3) uint8 RGB.
     """
 
-    def __init__(self, model_path: str = "sam2.1_b.pt"):
+    def __init__(
+        self,
+        model_path: str = "sam2.1_b.pt",
+        sam2_cfg: str = "configs/sam2.1/sam2.1_hiera_b+.yaml",
+    ):
+        self._model_path = model_path
+        self._sam2_cfg   = sam2_cfg
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
+        # Ultralytics SAM2 — used for per-frame everything-mode segmentation
         self.model = SAM(model_path)
         self.model.to(self.device)
+        # Meta SAM2 video predictor — loaded lazily on first segment_video() call
+        self._video_predictor = None
 
     def segment(self, image_rgb: np.ndarray) -> np.ndarray:
         """Run SAM2 on an RGB image and return a dense label map.
@@ -36,6 +45,86 @@ class Segmentation:
         for i, mask in enumerate(masks):
             label_map[mask] = i + 1
         return label_map
+
+    def segment_video(self, frames: np.ndarray) -> list[np.ndarray]:
+        """Temporally consistent segmentation using the SAM2 video predictor.
+
+        Runs everything-mode segmentation on frame 0 to obtain initial masks
+        for all objects, then propagates all of them through the full episode
+        using SAM2's video memory.  The result has the same per-pixel label
+        semantics as segment() but with consistent object IDs across frames.
+
+        Args:
+            frames: (N, H, W, 3) uint8 RGB — all frames of the episode.
+
+        Returns:
+            List of N (H, W) int32 label maps.  IDs match those assigned by
+            segment() on frame 0; background = 0.
+        """
+        from PIL import Image
+
+        if self._video_predictor is None:
+            try:
+                from sam2.build_sam import build_sam2_video_predictor
+            except ImportError:
+                raise ImportError(
+                    "The 'sam2' package is required for video segmentation. "
+                    "Install with: pip install sam2"
+                )
+            self._video_predictor = build_sam2_video_predictor(
+                self._sam2_cfg, self._model_path, device=self.device
+            )
+
+        N, H, W = frames.shape[:3]
+
+        # Everything-mode on frame 0 — provides initial masks for all objects
+        label_map_0  = self.segment(frames[0])
+        unique_ids   = np.unique(label_map_0)
+        unique_ids   = unique_ids[unique_ids > 0]   # drop background
+
+        pil_frames  = [Image.fromarray(f) for f in frames]
+        label_maps  = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
+        label_maps[0] = label_map_0
+
+        with torch.inference_mode():
+            state = self._video_predictor.init_state(video_path=pil_frames)
+
+            for obj_id in unique_ids:
+                mask = label_map_0 == obj_id
+                self._video_predictor.add_new_mask(
+                    state, frame_idx=0, obj_id=int(obj_id), mask=mask
+                )
+
+            # propagate_in_video skips frame 0 (already initialised above)
+            for frame_idx, obj_ids, mask_logits in \
+                    self._video_predictor.propagate_in_video(state):
+                masks = (mask_logits > 0.0).cpu().numpy()  # (N_obj, 1, H, W)
+                lm = np.zeros((H, W), dtype=np.int32)
+                for obj_id, m in zip(obj_ids, masks):
+                    lm[m[0]] = int(obj_id)
+                label_maps[frame_idx] = lm
+
+        return label_maps
+
+    def segment_with_bbox(self, image_rgb: np.ndarray, bbox: np.ndarray) -> np.ndarray:
+        """Segment using a bounding-box prompt — the primary SAM prompted mode.
+
+        Args:
+            image_rgb: (H, W, 3) uint8 RGB image.
+            bbox:      (4,) array [x_min, y_min, x_max, y_max] in pixel coords.
+
+        Returns:
+            mask: (H, W) bool — highest-confidence SAM mask inside the bbox.
+                  All-False if SAM returns nothing.
+        """
+        results = self.model(image_rgb, bboxes=[bbox.tolist()], verbose=False)
+        masks_obj = results[0].masks
+        if masks_obj is None:
+            return np.zeros(image_rgb.shape[:2], dtype=bool)
+        masks = masks_obj.data.cpu().numpy().astype(bool)  # (N, H, W), best-first
+        if len(masks) == 0:
+            return np.zeros(image_rgb.shape[:2], dtype=bool)
+        return masks[0]
 
     def lookup(self, label_map: np.ndarray, uv: np.ndarray) -> np.ndarray:
         """Look up segment IDs for a set of pixel coordinates.
@@ -75,7 +164,7 @@ class Segmentation:
 if __name__ == "__main__":
     from vision import RGBDData
 
-    data = RGBDData("data/run_7_high_accuracy")
+    data = RGBDData("data/episode_20260507_232139.zarr")
 
     rgb, _ = data.get_frame(0)
 

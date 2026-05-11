@@ -304,17 +304,135 @@ class Ext2Ego:
 
         return result, det
 
+    def detect_from_sam(
+        self, index: int, prev_det: MarkerDetection
+    ) -> MarkerDetection | None:
+        """Recover a MarkerDetection via SAM when ArUco detection fails.
+
+        Uses the bounding box of prev_det.corners as a SAM bbox prompt to
+        isolate the marker region, then fits a plane to the segmented depth
+        pixels via detect_plane_from_mask().
+
+        Args:
+            index:    Current frame index.
+            prev_det: Last successful MarkerDetection — corners define the SAM
+                      bbox prompt; angle_deg seeds the fitted plane's X-axis.
+
+        Returns:
+            MarkerDetection from the SAM plane fit, or None if segmentation
+            returns an empty mask or there are too few valid depth pixels.
+        """
+        if self.segmentation is None:
+            return None
+        rgb, _ = self.rgbd.get_frame(index)
+        corners = prev_det.corners                          # (4, 2) float32
+        pad = 5.0
+        bbox = np.array([
+            corners[:, 0].min() - pad,
+            corners[:, 1].min() - pad,
+            corners[:, 0].max() + pad,
+            corners[:, 1].max() + pad,
+        ])
+        mask = self.segmentation.segment_with_bbox(rgb, bbox)
+        if not mask.any():
+            return None
+        return self.tracker.detect_plane_from_mask(index, mask, prev_det)
+
+    def process_episode(self) -> np.ndarray | None:
+        N         = self.rgbd.num_frames
+        pc_arrays = np.zeros((N, 1024, 7), dtype=np.float32)
+
+        # Pre-compute temporally consistent label maps for the full episode.
+        if self.segmentation is not None:
+            label_maps = self.segmentation.segment_video(self.rgbd.color_frames)
+        else:
+            label_maps = [None] * N
+
+        prev_det = None
+        for index in range(N):
+            print(f"Processing index {index}")
+            label_map = label_maps[index]
+
+            pc  = self.rgbd.get_pointcloud(index, label_map=label_map)  # (N,6) or (N,7)
+            det = self.tracker.detect_plane(index)
+
+            if det is not None:
+                prev_det = det
+            elif prev_det is not None:
+                det = self.detect_from_sam(index, prev_det)
+                if det is not None:
+                    prev_det = det
+
+            if det is None:
+                # Catastrophic failure, ArUco not visible at all.
+                print(f"Aruco detection failed at index {index}")
+                return None
+
+            R, t = self.tracker.get_camera_pose(det)
+            self.set_pose(R, t)
+
+            xyz_cam         = self.transform(pc[:, :3])
+            _, frustum_mask = self.filter_frustum(xyz_cam)
+
+            xyz_frustum   = xyz_cam[frustum_mask]
+            extra_frustum = pc[frustum_mask, 3:]          # rgb (+ seg_id if present)
+            result        = np.concatenate([xyz_frustum, extra_frustum], axis=1)
+
+            # Ensure 7 columns: pad seg_id with zeros if segmentation was not run
+            if result.shape[1] == 6:
+                result = np.concatenate(
+                    [result, np.zeros((len(result), 1), dtype=np.float32)], axis=1
+                )
+
+            # Uniformly decimate (or upsample by repetition) to exactly 1024 points
+            if len(result) == 0:
+                pc_arrays[index] = 0.0
+            else:
+                idx = np.round(np.linspace(0, len(result) - 1, 1024)).astype(int)
+                pc_arrays[index] = result[idx]
+
+        return pc_arrays
+
 
 def main():
-    print("Hello from ext-to-ego!")
-    data = RGBDData('data/run_15_high_accuracy')
+    data    = RGBDData('data/episode_20260507_232139.zarr')
     tracker = ArucoTracker(data)
-    seg = Segmentation()
+    seg     = Segmentation()
     pipeline = Ext2Ego(data, tracker, 'config/camera.yaml', seg)
-    pts, det = pipeline.process(500)
-    print(f"Visible points shape: {pts.shape}")
-    plot_pc(pts)
 
+    # Frame 0 is guaranteed to have ArUco visible — use it as the reference
+    # detection and as the SAM prompt to validate detect_from_sam().
+    # aruco_det = tracker.detect_plane(0)
+    # print(f"ArUco  center={np.round(aruco_det.center, 1)}  "
+    #       f"tvec={np.round(aruco_det.tvec, 4)}")
+
+    # corners = aruco_det.corners
+    # pad = 5.0
+    # bbox = np.array([
+    #     corners[:, 0].min() - pad, corners[:, 1].min() - pad,
+    #     corners[:, 0].max() + pad, corners[:, 1].max() + pad,
+    # ])
+    # rgb, _ = data.get_frame(0)
+    # mask = seg.segment_with_bbox(rgb, bbox)
+    # print(f"SAM mask pixels: {mask.sum()}  (out of {mask.size})")
+
+    # if mask.any():
+    #     depth_frame = data.depth_frames[0]
+    #     ys, xs = np.where(mask)
+    #     z = depth_frame[ys, xs].astype(np.float64) * data.depth_scale
+    #     print(f"Depth at mask pixels — min={z.min():.3f}  max={z.max():.3f}  "
+    #           f"nonzero={(z > 0).sum()}")
+
+    # sam_det = pipeline.detect_from_sam(0, aruco_det)
+    # if sam_det is not None:
+    #     print(f"SAM    center={np.round(sam_det.center, 1)}  "
+    #           f"tvec={np.round(sam_det.tvec, 4)}")
+    #     print(f"tvec error (m): {np.linalg.norm(sam_det.tvec - aruco_det.tvec):.4f}")
+    # else:
+    #     print("SAM detection returned None")
+    ret = pipeline.process_episode()
+    if ret is None:
+        print("Episode cannot be processed...")
 
 if __name__ == "__main__":
     main()
