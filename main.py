@@ -1,7 +1,10 @@
+import os
+import shutil
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 import cv2
+import zarr
 from scipy.spatial import cKDTree
 from vision import RGBDData, ArucoTracker, MarkerDetection
 from segmentation import Segmentation
@@ -393,46 +396,80 @@ class Ext2Ego:
 
         return pc_arrays
 
+    def save_processed(self, pc_arrays: np.ndarray) -> str:
+        """Save processed episode data to a new zarr folder.
+
+        The output folder has the same name as the input with '_processed'
+        inserted before '.zarr'.  Images (RGB and depth) are not saved;
+        the pointcloud array replaces them.  Actions, observations, and
+        metadata are copied from the source episode as-is.
+
+        Args:
+            pc_arrays: (N, 1024, 7) float32 array from process_episode().
+
+        Returns:
+            Path to the written zarr folder.
+        """
+        src = self.rgbd.folder
+        base = src[:-5] if src.endswith(".zarr") else src
+        dst  = base + "_processed.zarr"
+
+        src_root = zarr.open(src, mode='r')
+
+        # Pointcloud — one chunk per frame for sequential read access
+        zarr.open_array(
+            os.path.join(dst, "pointcloud"),
+            mode='w', shape=pc_arrays.shape,
+            dtype=np.float32, chunks=(1, 1024, 7),
+        )[:] = pc_arrays
+
+        # Copy actions and observations verbatim
+        for group_name in ("actions", "observations"):
+            if group_name not in src_root:
+                continue
+            for key in src_root[group_name]:
+                data = np.asarray(src_root[group_name][key])
+                zarr.open_array(
+                    os.path.join(dst, group_name, key),
+                    mode='w', shape=data.shape,
+                    dtype=data.dtype, chunks=(1,) + data.shape[1:],
+                )[:] = data
+
+        # Copy metadata file(s)
+        for fname in ("metadata.json", "metadata.npz"):
+            src_file = os.path.join(src, fname)
+            if os.path.exists(src_file):
+                shutil.copy2(src_file, os.path.join(dst, fname))
+
+        print(f"Saved: {dst}")
+        return dst
+
 
 def main():
-    data    = RGBDData('data/episode_20260507_232139.zarr')
-    tracker = ArucoTracker(data)
-    seg     = Segmentation()
-    pipeline = Ext2Ego(data, tracker, 'config/camera.yaml', seg)
+    data_dir = "data"
+    episodes = sorted(
+        os.path.join(data_dir, e)
+        for e in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, e))
+        and not e.endswith("_processed.zarr")
+        and (
+            os.path.exists(os.path.join(data_dir, e, "metadata.json"))
+            or os.path.exists(os.path.join(data_dir, e, "metadata.npz"))
+        )
+    )
 
-    # Frame 0 is guaranteed to have ArUco visible — use it as the reference
-    # detection and as the SAM prompt to validate detect_from_sam().
-    # aruco_det = tracker.detect_plane(0)
-    # print(f"ArUco  center={np.round(aruco_det.center, 1)}  "
-    #       f"tvec={np.round(aruco_det.tvec, 4)}")
+    seg = Segmentation()  # loaded once; reused across all episodes
 
-    # corners = aruco_det.corners
-    # pad = 5.0
-    # bbox = np.array([
-    #     corners[:, 0].min() - pad, corners[:, 1].min() - pad,
-    #     corners[:, 0].max() + pad, corners[:, 1].max() + pad,
-    # ])
-    # rgb, _ = data.get_frame(0)
-    # mask = seg.segment_with_bbox(rgb, bbox)
-    # print(f"SAM mask pixels: {mask.sum()}  (out of {mask.size})")
-
-    # if mask.any():
-    #     depth_frame = data.depth_frames[0]
-    #     ys, xs = np.where(mask)
-    #     z = depth_frame[ys, xs].astype(np.float64) * data.depth_scale
-    #     print(f"Depth at mask pixels — min={z.min():.3f}  max={z.max():.3f}  "
-    #           f"nonzero={(z > 0).sum()}")
-
-    # sam_det = pipeline.detect_from_sam(0, aruco_det)
-    # if sam_det is not None:
-    #     print(f"SAM    center={np.round(sam_det.center, 1)}  "
-    #           f"tvec={np.round(sam_det.tvec, 4)}")
-    #     print(f"tvec error (m): {np.linalg.norm(sam_det.tvec - aruco_det.tvec):.4f}")
-    # else:
-    #     print("SAM detection returned None")
-    ret = pipeline.process_episode()
-    if ret is None:
-        print("Episode cannot be processed...")
+    for episode in episodes:
+        print(f"\n=== Processing {episode} ===")
+        data     = RGBDData(episode)
+        tracker  = ArucoTracker(data)
+        pipeline = Ext2Ego(data, tracker, "config/camera.yaml", seg)
+        ret = pipeline.process_episode()
+        if ret is None:
+            print(f"  SKIP: episode cannot be processed.")
+        else:
+            pipeline.save_processed(ret)
 
 if __name__ == "__main__":
     main()

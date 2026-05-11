@@ -21,6 +21,7 @@ class RGBDData:
 
     def __init__(self, folder: str):
         folder = folder.rstrip("/\\")
+        self.folder = folder
         if os.path.exists(os.path.join(folder, "metadata.json")):
             self._load_new_format(folder)
         elif os.path.exists(os.path.join(folder, "metadata.npz")):
