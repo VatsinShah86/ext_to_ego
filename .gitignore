@@ -9,6 +9,6 @@ wheels/
 *.pth
 .DS_Store
 *.pt
-data/
+data*/
 # Virtual environments
 .venv
