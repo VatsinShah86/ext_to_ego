@@ -46,16 +46,18 @@ class Segmentation:
             label_map[mask] = i + 1
         return label_map
 
-    def segment_video(self, frames: np.ndarray) -> list[np.ndarray]:
+    def segment_video(
+        self, frames: np.ndarray, chunk_size: int = 200
+    ) -> list[np.ndarray]:
         """Temporally consistent segmentation using the SAM2 video predictor.
 
-        Runs everything-mode segmentation on frame 0 to obtain initial masks
-        for all objects, then propagates all of them through the full episode
-        using SAM2's video memory.  The result has the same per-pixel label
-        semantics as segment() but with consistent object IDs across frames.
+        Processes the episode in fixed-size chunks to bound GPU/CPU memory use.
+        Frame 0 of each chunk is seeded from the last label map of the previous
+        chunk, so object IDs remain consistent across chunk boundaries.
 
         Args:
-            frames: (N, H, W, 3) uint8 RGB — all frames of the episode.
+            frames:     (N, H, W, 3) uint8 RGB — all frames of the episode.
+            chunk_size: Number of frames per SAM2 video-predictor call.
 
         Returns:
             List of N (H, W) int32 label maps.  IDs match those assigned by
@@ -78,48 +80,58 @@ class Segmentation:
             )
 
         N, H, W = frames.shape[:3]
+        label_maps = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
 
-        # Everything-mode on frame 0 — provides initial masks for all objects
-        label_map_0 = self.segment(frames[0])
-        unique_ids  = np.unique(label_map_0)
-        unique_ids  = unique_ids[unique_ids > 0]   # drop background
+        # Seed from frame 0 using everything-mode (image model must be on GPU)
+        seed_label_map = self.segment(frames[0])
+        label_maps[0]  = seed_label_map
 
-        label_maps    = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
-        label_maps[0] = label_map_0
-
-        # Free the Ultralytics SAM model from GPU before the video predictor
-        # runs — both models loaded simultaneously would exhaust VRAM.
+        # Move image model off GPU for the duration of video prediction
         self.model.to("cpu")
         torch.cuda.empty_cache()
 
-        # SAM2 video predictor requires a JPEG folder — write frames to a temp dir
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i, frame in enumerate(frames):
-                Image.fromarray(frame).save(os.path.join(tmpdir, f"{i:05d}.jpg"))
+        try:
+            for chunk_start in range(0, N, chunk_size):
+                chunk_end    = min(chunk_start + chunk_size, N)
+                chunk_frames = frames[chunk_start:chunk_end]
 
-            with torch.inference_mode():
-                # offload_state_to_cpu keeps per-frame encoder features in CPU RAM
-                # rather than accumulating them all on GPU (would exhaust VRAM for
-                # long episodes).
-                state = self._video_predictor.init_state(
-                    video_path=tmpdir, offload_state_to_cpu=True
-                )
+                unique_ids = np.unique(seed_label_map)
+                unique_ids = unique_ids[unique_ids > 0]
 
-                for obj_id in unique_ids:
-                    mask = label_map_0 == obj_id
-                    self._video_predictor.add_new_mask(
-                        state, frame_idx=0, obj_id=int(obj_id), mask=mask
-                    )
+                print(f"  chunk [{chunk_start}, {chunk_end}) — "
+                      f"{len(unique_ids)} objects")
 
-                for frame_idx, obj_ids, mask_logits in \
-                        self._video_predictor.propagate_in_video(state):
-                    masks = (mask_logits > 0.0).cpu().numpy()  # (N_obj, 1, H, W)
-                    lm = np.zeros((H, W), dtype=np.int32)
-                    for obj_id, m in zip(obj_ids, masks):
-                        lm[m[0]] = int(obj_id)
-                    label_maps[frame_idx] = lm
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for i, frame in enumerate(chunk_frames):
+                        Image.fromarray(frame).save(
+                            os.path.join(tmpdir, f"{i:05d}.jpg")
+                        )
 
-        self.model.to(self.device)
+                    with torch.inference_mode():
+                        state = self._video_predictor.init_state(
+                            video_path=tmpdir, offload_state_to_cpu=True
+                        )
+                        for obj_id in unique_ids:
+                            self._video_predictor.add_new_mask(
+                                state, frame_idx=0, obj_id=int(obj_id),
+                                mask=seed_label_map == obj_id,
+                            )
+                        for frame_idx, obj_ids, mask_logits in \
+                                self._video_predictor.propagate_in_video(state):
+                            masks = (mask_logits > 0.0).cpu().numpy()
+                            lm = np.zeros((H, W), dtype=np.int32)
+                            for obj_id, m in zip(obj_ids, masks):
+                                lm[m[0]] = int(obj_id)
+                            label_maps[chunk_start + frame_idx] = lm
+
+                # Last frame of this chunk seeds the next chunk
+                seed_label_map = label_maps[chunk_end - 1]
+        with Exception as e:
+            print(f"Ran into exception: {e}")
+        finally:
+            # Restore image model to GPU regardless of whether an error occurred
+            self.model.to(self.device)
+
         return label_maps
 
     def segment_with_bbox(self, image_rgb: np.ndarray, bbox: np.ndarray) -> np.ndarray:
