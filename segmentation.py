@@ -47,7 +47,7 @@ class Segmentation:
         return label_map
 
     def segment_video(
-        self, frames: np.ndarray, chunk_size: int = 200
+        self, frames: np.ndarray, chunk_size: int = 500
     ) -> list[np.ndarray]:
         """Temporally consistent segmentation using the SAM2 video predictor.
 
@@ -126,7 +126,7 @@ class Segmentation:
 
                 # Last frame of this chunk seeds the next chunk
                 seed_label_map = label_maps[chunk_end - 1]
-        with Exception as e:
+        except Exception as e:
             print(f"Ran into exception: {e}")
         finally:
             # Restore image model to GPU regardless of whether an error occurred
