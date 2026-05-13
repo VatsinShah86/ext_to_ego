@@ -44,7 +44,7 @@ class DepthCamera:
 
         # Compensate for darker image by boosting gain
         # Range: 0-128, higher = brighter but more noise
-        color_sensor.set_option(rs.option.gain, 64)
+        color_sensor.set_option(rs.option.gain, 32)
 
         self.temporal = rs.temporal_filter()
         self.temporal.set_option(rs.option.filter_smooth_alpha, 0.1)
