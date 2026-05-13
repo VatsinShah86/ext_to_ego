@@ -33,14 +33,18 @@ class DepthCamera:
         depth_sensor.set_option(rs.option.visual_preset, 3)  # 3 = High Accuracy preset
         print("RealSense configured for high accuracy mode")
         
-        # Depth post-processing filters
-        # self.decimation = rs.decimation_filter()
-        # self.decimation.set_option(rs.option.filter_magnitude, 2)
+        color_sensor = profile.get_device().first_color_sensor()
 
-        # self.spatial = rs.spatial_filter()
-        # self.spatial.set_option(rs.option.filter_magnitude, 2)
-        # self.spatial.set_option(rs.option.filter_smooth_alpha, 0.5)
-        # self.spatial.set_option(rs.option.filter_smooth_delta, 20)
+        # Disable auto-exposure first — required before setting manual value
+        color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+
+        # Set exposure in microseconds — lower = less blur, darker image
+        # D435i color range: ~1 to 10000 microseconds
+        color_sensor.set_option(rs.option.exposure, 500)  # start here, tune down if still blurry
+
+        # Compensate for darker image by boosting gain
+        # Range: 0-128, higher = brighter but more noise
+        color_sensor.set_option(rs.option.gain, 64)
 
         self.temporal = rs.temporal_filter()
         self.temporal.set_option(rs.option.filter_smooth_alpha, 0.1)
@@ -49,25 +53,7 @@ class DepthCamera:
         self.hole_filling = rs.hole_filling_filter()
         # Warmup: read frames until we get valid non-empty point clouds
         print("Warming up camera...")
-        # max_warmup_attempts = 30
-        # for attempt in range(max_warmup_attempts):
-        #     try:
-        #         success, depth_frame, color_frame = self.get_raw_frame()
-        #         if success:
-        #             # Check if we can extract valid depth data
-        #             depth_data = np.asanyarray(depth_frame.get_data()).astype(np.float32) * self.depth_scale
-        #             color_data = np.asanyarray(color_frame.get_data())
-                    
-        #             # Check if we have valid depth values (not all zeros)
-        #             valid_depth = depth_data[(depth_data > 0) & (depth_data < 3.0)]
-        #             if valid_depth.size > 100:  # At least 100 valid depth pixels
-        #                 print(f"Warmup complete: valid depth data captured on attempt {attempt + 1}")
-        #                 break
-        #     except:
-        #         pass
-        #     time.sleep(0.05)
-        # else:
-        #     print(f"Warning: warmup completed after {max_warmup_attempts} attempts, but depth data may not be stable")
+        
         time.sleep(10)
 
     def get_raw_frame(self):
