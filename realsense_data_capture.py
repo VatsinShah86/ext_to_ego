@@ -30,7 +30,11 @@ class DepthCamera:
         
         # Set depth sensor to high accuracy preset for better quality
         depth_sensor = profile.get_device().first_depth_sensor()
-        depth_sensor.set_option(rs.option.visual_preset, 3)  # 3 = High Accuracy preset
+        # depth_sensor.set_option(rs.option.visual_preset, 3)  # 3 = High Accuracy preset
+        depth_sensor.set_option(rs.option.emitter_enabled, 1)
+        laser_range = depth_sensor.get_option_range(rs.option.laser_power)
+        depth_sensor.set_option(rs.option.laser_power, laser_range.max)
+        print(f"Laser power set to {laser_range.max}")
         print("RealSense configured for high accuracy mode")
         
         color_sensor = profile.get_device().first_color_sensor()
@@ -40,11 +44,11 @@ class DepthCamera:
 
         # Set exposure in microseconds — lower = less blur, darker image
         # D435i color range: ~1 to 10000 microseconds
-        color_sensor.set_option(rs.option.exposure, 500)  # start here, tune down if still blurry
+        color_sensor.set_option(rs.option.exposure, 100)  # start here, tune down if still blurry
 
         # Compensate for darker image by boosting gain
         # Range: 0-128, higher = brighter but more noise
-        color_sensor.set_option(rs.option.gain, 32)
+        color_sensor.set_option(rs.option.gain, 128)
 
         self.temporal = rs.temporal_filter()
         self.temporal.set_option(rs.option.filter_smooth_alpha, 0.1)

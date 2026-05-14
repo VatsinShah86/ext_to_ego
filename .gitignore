@@ -10,5 +10,6 @@ wheels/
 .DS_Store
 *.pt
 data*/
+mobile_sam*
 # Virtual environments
 .venv

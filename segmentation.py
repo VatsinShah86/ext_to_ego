@@ -5,7 +5,11 @@ from ultralytics import SAM
 
 
 class Segmentation:
-    """SAM2-based image segmentation producing per-pixel integer label maps.
+    """Segmentation producing per-pixel integer label maps.
+
+    Per-frame segmentation uses an ultralytics SAM model (SAM2 or MobileSAM).
+    Video/streaming segmentation uses the Meta SAM2 video predictor, which may
+    use a different (SAM2-only) checkpoint than the per-frame model.
 
     All inputs and outputs are numpy arrays — no dependency on vision.py.
     Images are expected as (H, W, 3) uint8 RGB.
@@ -15,18 +19,39 @@ class Segmentation:
         self,
         model_path: str = "sam2.1_b.pt",
         sam2_cfg: str = "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        sam2_video_model_path: str | None = None,
+        # Mask-generator tuning — same names as SamAutomaticMaskGenerator
+        points_per_side: int = 16,           # default SAM: 32 — halving ≈ 4× speedup
+        points_per_batch: int = 128,         # default: 64  — doubles GPU parallelism
+        pred_iou_thresh: float = 0.88,       # skip masks below this predicted IoU
+        stability_score_thresh: float = 0.95,
+        min_mask_region_area: int = 100,     # drop masks smaller than this (pixels)
+        crop_n_layers: int = 0,              # 0 = no multi-scale crops; each layer ≈ 4× cost
     ):
-        self._model_path = model_path
-        self._sam2_cfg   = sam2_cfg
+        self._model_path            = model_path
+        self._sam2_cfg              = sam2_cfg
+        # Video predictor requires a SAM2 checkpoint; falls back to model_path if not set.
+        self._sam2_video_model_path = sam2_video_model_path or model_path
+        # Mask-generator params (kept in segment_anything API names)
+        self._points_per_side        = points_per_side
+        self._points_per_batch       = points_per_batch
+        self._pred_iou_thresh        = pred_iou_thresh
+        self._stability_score_thresh = stability_score_thresh
+        self._min_mask_region_area   = min_mask_region_area
+        self._crop_n_layers          = crop_n_layers
+
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda")
-        # Ultralytics SAM2 — used for per-frame everything-mode segmentation
+        # Ultralytics SAM — used for per-frame everything-mode segmentation
         self.model = SAM(model_path)
         self.model.to(self.device)
         # Meta SAM2 video predictor — loaded lazily on first segment_video() call
         self._video_predictor = None
 
     def segment(self, image_rgb: np.ndarray) -> np.ndarray:
-        """Run SAM2 on an RGB image and return a dense label map.
+        """Run SAM on an RGB image and return a dense label map.
+
+        Mask-generator parameters (points_per_side, pred_iou_thresh, …) are set
+        at construction time and forwarded to the ultralytics generate() call.
 
         Args:
             image_rgb: (H, W, 3) uint8 RGB image.
@@ -35,12 +60,32 @@ class Segmentation:
             label_map: (H, W) int32 array. 0 = background, 1..N = instance IDs.
                        If multiple masks overlap, the higher ID wins.
         """
-        results = self.model(image_rgb, verbose=False)
+        # Lazy-init the ultralytics predictor on first call.
+        if self.model.predictor is None:
+            self.model.predict(image_rgb, verbose=False)
+
+        # Call the predictor directly so **kwargs reach generate() via:
+        #   predictor.__call__ → stream_inference → inference → generate
+        # model.predict() alone does NOT forward extra kwargs to generate().
+        results = self.model.predictor(
+            source=image_rgb,
+            stream=False,
+            points_stride=self._points_per_side,
+            points_batch_size=self._points_per_batch,
+            conf_thres=self._pred_iou_thresh,
+            stability_score_thresh=self._stability_score_thresh,
+            crop_n_layers=self._crop_n_layers,
+        )
+
         masks_obj = results[0].masks
         if masks_obj is None:
             return np.zeros(image_rgb.shape[:2], dtype=np.int32)
 
         masks = masks_obj.data.cpu().numpy().astype(bool)  # (N, H, W)
+
+        if self._min_mask_region_area > 0:
+            masks = masks[masks.sum(axis=(1, 2)) >= self._min_mask_region_area]
+
         label_map = np.zeros(image_rgb.shape[:2], dtype=np.int32)
         for i, mask in enumerate(masks):
             label_map[mask] = i + 1
@@ -76,7 +121,7 @@ class Segmentation:
                     "Install with: pip install sam2"
                 )
             self._video_predictor = build_sam2_video_predictor(
-                self._sam2_cfg, self._model_path, device=self.device
+                self._sam2_cfg, self._sam2_video_model_path, device=self.device
             )
 
         N, H, W = frames.shape[:3]
@@ -131,6 +176,77 @@ class Segmentation:
         finally:
             # Restore image model to GPU regardless of whether an error occurred
             self.model.to(self.device)
+
+        return label_maps
+
+    def segment_live_chunk(
+        self,
+        frames: list[np.ndarray],
+        seed_label_map: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        """Propagate segmentation through a chunk of live frames using the video predictor.
+
+        Designed for continuous streaming: seed from the last chunk's final label map to
+        maintain object-ID consistency across chunk boundaries.  If seed_label_map is None,
+        frame 0 is seeded via segment() — a one-time ~1.3 s startup cost.  After that call
+        self.model is moved to CPU permanently; only the video predictor runs from then on.
+
+        Args:
+            frames:         List of (H, W, 3) uint8 RGB frames.
+            seed_label_map: (H, W) int32 label map for frame 0, or None to auto-seed.
+
+        Returns:
+            List of N (H, W) int32 label maps, one per input frame.
+        """
+        import os
+        import tempfile
+        from PIL import Image
+
+        if self._video_predictor is None:
+            try:
+                from sam2.build_sam import build_sam2_video_predictor
+            except ImportError:
+                raise ImportError("sam2 package is required for live chunk segmentation.")
+            self._video_predictor = build_sam2_video_predictor(
+                self._sam2_cfg, self._sam2_video_model_path, device=self.device
+            )
+
+        N = len(frames)
+        H, W = frames[0].shape[:2]
+        label_maps = [np.zeros((H, W), dtype=np.int32) for _ in range(N)]
+
+        if seed_label_map is None:
+            seed_label_map = self.segment(frames[0])
+            # self.model is no longer needed — move off GPU and leave it there
+            self.model.to("cpu")
+            torch.cuda.empty_cache()
+        label_maps[0] = seed_label_map
+
+        unique_ids = np.unique(seed_label_map)
+        unique_ids = unique_ids[unique_ids > 0]
+        if len(unique_ids) == 0:
+            return label_maps
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, frame in enumerate(frames):
+                Image.fromarray(frame).save(os.path.join(tmpdir, f"{i:05d}.jpg"))
+
+            with torch.inference_mode():
+                state = self._video_predictor.init_state(
+                    video_path=tmpdir, offload_state_to_cpu=True
+                )
+                for obj_id in unique_ids:
+                    self._video_predictor.add_new_mask(
+                        state, frame_idx=0, obj_id=int(obj_id),
+                        mask=seed_label_map == obj_id,
+                    )
+                for frame_idx, obj_ids, mask_logits in \
+                        self._video_predictor.propagate_in_video(state):
+                    masks = (mask_logits > 0.0).cpu().numpy()
+                    lm = np.zeros((H, W), dtype=np.int32)
+                    for obj_id, m in zip(obj_ids, masks):
+                        lm[m[0]] = int(obj_id)
+                    label_maps[frame_idx] = lm
 
         return label_maps
 
@@ -191,11 +307,15 @@ class Segmentation:
 
 if __name__ == "__main__":
     from vision import RGBDData
+    import time
 
     data = RGBDData("data/episode_20260507_232139.zarr")
 
     rgb, _ = data.get_frame(0)
 
     seg = Segmentation()
+    t0 = time.perf_counter()
     label_map = seg.segment(rgb)
+    t1 = time.perf_counter()
+    print(f"Elapsed time: {t1-t0}")
     seg.show(rgb, label_map)

@@ -112,6 +112,38 @@ class RGBDData:
             raise IndexError(f"Frame index {index} out of range [0, {self.num_frames - 1}]")
         return self.color_frames[index], self.depth_frames[index].astype(np.float32) * self.depth_scale
 
+    @staticmethod
+    def get_pointcloud_from_arrays(
+        color_rgb: np.ndarray,
+        depth_m: np.ndarray,
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        max_z: float = 10.0,
+        label_map: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Build a point cloud from raw arrays without a stored episode.
+
+        depth_m must already be in metres.  Mirrors get_pointcloud() logic.
+        """
+        h, w = depth_m.shape
+        uu, vv = np.meshgrid(np.arange(w, dtype=np.float32),
+                             np.arange(h, dtype=np.float32))
+        pts = np.stack([uu.ravel(), vv.ravel()], axis=-1).reshape(-1, 1, 2)
+        pts_norm = cv2.undistortPoints(pts, camera_matrix, dist_coeffs).reshape(h, w, 2)
+
+        z = depth_m
+        x = pts_norm[..., 0] * z
+        y = pts_norm[..., 1] * z
+
+        valid = (z > 0) & (z <= max_z)
+        xyz = np.stack([x, y, z], axis=-1)[valid]
+        rgb = color_rgb[valid].astype(np.float32)
+
+        if label_map is not None:
+            seg_ids = label_map[valid].astype(np.float32).reshape(-1, 1)
+            return np.concatenate([xyz, rgb, seg_ids], axis=-1)
+        return np.concatenate([xyz, rgb], axis=-1)
+
     def get_pointcloud(self, index: int, max_z: float = 10.0,
                        label_map: np.ndarray | None = None) -> np.ndarray:
         """Return an (N, 6) or (N, 7) float32 array for valid depth pixels.
@@ -263,6 +295,65 @@ class ArucoTracker:
         # Invert → aruco frame → camera frame
         self._R_aruco_camera: np.ndarray = R_C_A.T
         self._t_aruco_camera: np.ndarray = -R_C_A.T @ t_C_A
+
+    @classmethod
+    def from_calibration(
+        cls,
+        calib_path: str = "calibration.npz",
+        marker_size_m: float = 0.0468,
+    ) -> "ArucoTracker":
+        """Construct an ArucoTracker from the calibration.npz used to stamp all episodes.
+
+        This is the correct source for the real-time runtime — the same intrinsics
+        that update_metadata.py wrote into every episode's metadata.json.
+        """
+        calib = np.load(calib_path, allow_pickle=True)
+        return cls.from_intrinsics(
+            calib["camera_matrix"],
+            calib["dist_coeffs"],
+            marker_size_m=marker_size_m,
+        )
+
+    @classmethod
+    def from_intrinsics(
+        cls,
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        marker_size_m: float = 0.0468,
+    ) -> "ArucoTracker":
+        """Construct an ArucoTracker from explicit intrinsics without a zarr episode.
+
+        Use this for the real-time runtime where no RGBDData is available.
+        Only the *_from_frame methods are valid on instances built this way.
+        """
+        obj = cls.__new__(cls)
+        obj.rgbd = None
+        obj.marker_size_m = marker_size_m
+        obj.camera_matrix = camera_matrix.astype(np.float64)
+        obj.dist_coeffs   = dist_coeffs.reshape(-1, 1).astype(np.float64)
+
+        h = marker_size_m / 2
+        obj._obj_pts = np.array([
+            [-h,  h, 0.],
+            [ h,  h, 0.],
+            [ h, -h, 0.],
+            [-h, -h, 0.],
+        ], dtype=np.float64)
+
+        params = cv2.aruco.DetectorParameters()
+        params.minMarkerPerimeterRate = 0.01
+        params.errorCorrectionRate    = 1.0
+        obj._detector = cv2.aruco.ArucoDetector(cls._DICT, params)
+
+        r, y = -np.pi / 2, -np.pi / 2
+        Rx = np.array([[1, 0, 0], [0, np.cos(r), -np.sin(r)], [0, np.sin(r), np.cos(r)]])
+        Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
+        R_C_A = Rz @ Rx
+        t_C_A = np.array([0.0, 0.0, -0.02])
+        obj._R_aruco_camera = R_C_A.T
+        obj._t_aruco_camera = -R_C_A.T @ t_C_A
+
+        return obj
 
     def camera_in_aruco_frame(self) -> tuple[np.ndarray, np.ndarray]:
         """Return (R, t): orientation and position of the camera origin in the aruco frame.
@@ -416,6 +507,178 @@ class ArucoTracker:
             depth_samples=det.depth_samples,
             rvec=rvec_plane.flatten(),
             tvec=centroid,
+        )
+
+    def detect_from_frame(
+        self, color_rgb: np.ndarray, depth_m: np.ndarray
+    ) -> "MarkerDetection | None":
+        """Detect marker id=0 from raw RGB and pre-scaled depth (metres).
+
+        Mirrors detect() but takes arrays directly; no RGBDData required.
+        """
+        bgr = color_rgb[..., ::-1]
+        corners, ids, _ = self._detector.detectMarkers(bgr)
+        if ids is None:
+            return None
+
+        ids_flat = ids.flatten()
+        matches  = [i for i, mid in enumerate(ids_flat) if mid == 0]
+        if not matches:
+            return None
+
+        marker_corners = corners[matches[0]][0]
+        center         = marker_corners.mean(axis=0)
+        dx, dy         = marker_corners[1] - marker_corners[0]
+        angle_deg      = float(np.degrees(np.arctan2(dy, dx)))
+
+        pts = np.round(marker_corners).astype(int)
+        pts[:, 0] = np.clip(pts[:, 0], 0, depth_m.shape[1] - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, depth_m.shape[0] - 1)
+        depth_samples = depth_m[pts[:, 1], pts[:, 0]].astype(np.float32)
+
+        _, rvec, tvec = cv2.solvePnP(
+            self._obj_pts,
+            marker_corners.astype(np.float64),
+            self.camera_matrix,
+            self.dist_coeffs,
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
+        )
+        rvec, tvec = rvec.flatten(), tvec.flatten()
+
+        valid = depth_samples[depth_samples > 0]
+        if len(valid):
+            z          = float(valid.mean())
+            center_pt  = np.array([[[float(center[0]), float(center[1])]]], dtype=np.float64)
+            center_norm = cv2.undistortPoints(center_pt, self.camera_matrix, self.dist_coeffs).flatten()
+            p_depth    = np.array([center_norm[0] * z, center_norm[1] * z, z])
+            R, _       = cv2.Rodrigues(rvec)
+            marker_normal = R[:, 2]
+            tvec = tvec + float(marker_normal @ (p_depth - tvec)) * marker_normal
+
+        return MarkerDetection(
+            corners=marker_corners, center=center, angle_deg=angle_deg,
+            depth_samples=depth_samples, rvec=rvec, tvec=tvec,
+        )
+
+    def detect_plane_from_frame(
+        self, color_rgb: np.ndarray, depth_m: np.ndarray
+    ) -> "MarkerDetection | None":
+        """Run detect_plane() logic on raw RGB and depth (metres) arrays."""
+        det = self.detect_from_frame(color_rgb, depth_m)
+        if det is None:
+            return None
+
+        h_img, w_img = depth_m.shape
+        mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        cv2.polylines(mask, [det.corners.astype(np.int32).reshape(-1, 1, 2)],
+                      isClosed=True, color=255, thickness=2)
+        ys, xs = np.where(mask > 0)
+
+        z     = depth_m[ys, xs].astype(np.float64)
+        valid = z > 0
+        if valid.sum() < 6:
+            return det
+
+        xs, ys, z = xs[valid].astype(np.float64), ys[valid].astype(np.float64), z[valid]
+        pts_2d   = np.stack([xs, ys], axis=-1).reshape(-1, 1, 2)
+        pts_norm = cv2.undistortPoints(pts_2d, self.camera_matrix, self.dist_coeffs).reshape(-1, 2)
+        pts3d    = np.stack([pts_norm[:, 0] * z, pts_norm[:, 1] * z, z], axis=1)
+
+        centroid  = pts3d.mean(axis=0)
+        _, _, Vt  = np.linalg.svd(pts3d - centroid, full_matrices=False)
+        normal    = Vt[-1]
+        if normal[2] > 0:
+            normal = -normal
+
+        def backproject(corner_idx: int) -> np.ndarray | None:
+            cx, cy = det.corners[corner_idx]
+            ci, ri = int(np.clip(cx, 0, w_img - 1)), int(np.clip(cy, 0, h_img - 1))
+            d = float(depth_m[ri, ci])
+            if d <= 0:
+                return None
+            pt   = np.array([[[float(cx), float(cy)]]], dtype=np.float64)
+            norm = cv2.undistortPoints(pt, self.camera_matrix, self.dist_coeffs).flatten()
+            return np.array([norm[0] * d, norm[1] * d, d])
+
+        p_TL, p_TR = backproject(0), backproject(1)
+        if p_TL is not None and p_TR is not None:
+            x_cand = p_TR - p_TL
+        else:
+            angle_rad = np.radians(det.angle_deg)
+            x_cand    = np.array([np.cos(angle_rad), np.sin(angle_rad), 0.0])
+
+        x_axis  = x_cand - np.dot(x_cand, normal) * normal
+        x_axis /= np.linalg.norm(x_axis)
+        y_axis  = np.cross(normal, x_axis)
+        y_axis /= np.linalg.norm(y_axis)
+        z_axis  = np.cross(x_axis, y_axis)
+        z_axis /= np.linalg.norm(z_axis)
+
+        R_plane, _ = cv2.Rodrigues(np.column_stack([x_axis, y_axis, z_axis]))
+
+        return MarkerDetection(
+            corners=det.corners, center=det.center, angle_deg=det.angle_deg,
+            depth_samples=det.depth_samples, rvec=R_plane.flatten(), tvec=centroid,
+        )
+
+    def detect_plane_from_mask_frame(
+        self, depth_m: np.ndarray, mask: np.ndarray, prev_det: "MarkerDetection"
+    ) -> "MarkerDetection | None":
+        """Fit a marker plane from a SAM mask on a raw depth array (metres).
+
+        Mirrors detect_plane_from_mask() but takes depth_m directly.
+        """
+        h_img, w_img = depth_m.shape
+        ys, xs = np.where(mask)
+        if len(ys) == 0:
+            return None
+
+        z     = depth_m[ys, xs].astype(np.float64)
+        valid = z > 0
+        if valid.sum() < 6:
+            return None
+
+        xs_v, ys_v, z_v = xs[valid].astype(np.float64), ys[valid].astype(np.float64), z[valid]
+        pts_2d   = np.stack([xs_v, ys_v], axis=-1).reshape(-1, 1, 2)
+        pts_norm = cv2.undistortPoints(pts_2d, self.camera_matrix, self.dist_coeffs).reshape(-1, 2)
+        pts3d    = np.stack([pts_norm[:, 0] * z_v, pts_norm[:, 1] * z_v, z_v], axis=1)
+
+        centroid  = pts3d.mean(axis=0)
+        _, _, Vt  = np.linalg.svd(pts3d - centroid, full_matrices=False)
+        normal    = Vt[-1]
+        if normal[2] > 0:
+            normal = -normal
+
+        angle_rad = np.radians(prev_det.angle_deg)
+        x_cand    = np.array([np.cos(angle_rad), np.sin(angle_rad), 0.0])
+        x_axis    = x_cand - np.dot(x_cand, normal) * normal
+        norm_x    = np.linalg.norm(x_axis)
+        if norm_x < 1e-6:
+            x_axis = np.array([1., 0., 0.])
+            x_axis = x_axis - np.dot(x_axis, normal) * normal
+            x_axis /= np.linalg.norm(x_axis)
+        else:
+            x_axis /= norm_x
+        y_axis  = np.cross(normal, x_axis)
+        y_axis /= np.linalg.norm(y_axis)
+        z_axis  = np.cross(x_axis, y_axis)
+        z_axis /= np.linalg.norm(z_axis)
+
+        R_plane, _ = cv2.Rodrigues(np.column_stack([x_axis, y_axis, z_axis]))
+
+        center_2d = np.array([xs_v.mean(), ys_v.mean()], dtype=np.float32)
+        corners   = np.array([
+            [xs_v.min(), ys_v.min()], [xs_v.max(), ys_v.min()],
+            [xs_v.max(), ys_v.max()], [xs_v.min(), ys_v.max()],
+        ], dtype=np.float32)
+        cpts = np.round(corners).astype(int)
+        cpts[:, 0] = np.clip(cpts[:, 0], 0, w_img - 1)
+        cpts[:, 1] = np.clip(cpts[:, 1], 0, h_img - 1)
+        depth_samples = depth_m[cpts[:, 1], cpts[:, 0]].astype(np.float32)
+
+        return MarkerDetection(
+            corners=corners, center=center_2d, angle_deg=prev_det.angle_deg,
+            depth_samples=depth_samples, rvec=R_plane.flatten(), tvec=centroid,
         )
 
     def detect_plane_from_mask(

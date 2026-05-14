@@ -159,7 +159,7 @@ class Ext2Ego:
     single per-frame process() call.
     """
 
-    def __init__(self, rgbd: RGBDData, tracker: ArucoTracker, config_path: str,
+    def __init__(self, rgbd: RGBDData | None, tracker: ArucoTracker, config_path: str,
                  segmentation: Segmentation | None = None):
         self.rgbd         = rgbd
         self.tracker      = tracker
@@ -341,19 +341,103 @@ class Ext2Ego:
             return None
         return self.tracker.detect_plane_from_mask(index, mask, prev_det)
 
+    def detect_from_sam_frame(
+        self, color_rgb: np.ndarray, depth_m: np.ndarray, prev_det: MarkerDetection
+    ) -> MarkerDetection | None:
+        """SAM fallback for a live frame — mirrors detect_from_sam() but takes arrays."""
+        if self.segmentation is None:
+            return None
+        corners = prev_det.corners
+        pad  = 5.0
+        bbox = np.array([
+            corners[:, 0].min() - pad, corners[:, 1].min() - pad,
+            corners[:, 0].max() + pad, corners[:, 1].max() + pad,
+        ])
+        mask = self.segmentation.segment_with_bbox(color_rgb, bbox)
+        if not mask.any():
+            return None
+        return self.tracker.detect_plane_from_mask_frame(depth_m, mask, prev_det)
+
+    def process_live(
+        self,
+        color_rgb: np.ndarray,
+        depth_m: np.ndarray,
+        prev_det: MarkerDetection | None = None,
+        label_map: np.ndarray | None = None,
+        occlusion: bool = False,
+    ) -> tuple[np.ndarray, MarkerDetection | None]:
+        """Process a single live RGBD frame into a (1024, 7) ego-frame point cloud.
+
+        Args:
+            color_rgb:  (H, W, 3) uint8 RGB — convert from RealSense BGR before calling.
+            depth_m:    (H, W) float32 depth in metres, aligned to color.
+            prev_det:   Last good MarkerDetection; enables SAM fallback when ArUco is occluded.
+            label_map:  (H, W) int32 segmentation labels, or None to run per-frame SAM2.
+            occlusion:  Whether to apply occlusion culling (slower).
+
+        Returns:
+            (pc, det) — pc is (1024, 7) float32 in ego frame; det is the MarkerDetection
+            used this frame (pass back as prev_det on the next call).
+            Returns (zeros, None) if marker detection fails completely.
+        """
+        if label_map is None and self.segmentation is not None:
+            label_map = self.segmentation.segment(color_rgb)
+
+        pc  = RGBDData.get_pointcloud_from_arrays(
+            color_rgb, depth_m,
+            self.tracker.camera_matrix,
+            self.tracker.dist_coeffs,
+            label_map=label_map,
+        )
+
+        det = self.tracker.detect_plane_from_frame(color_rgb, depth_m)
+
+        if det is not None:
+            prev_det = det
+        elif prev_det is not None:
+            det = self.detect_from_sam_frame(color_rgb, depth_m, prev_det)
+            if det is not None:
+                prev_det = det
+
+        if det is None:
+            return np.zeros((1024, 7), dtype=np.float32), None
+
+        R, t = self.tracker.get_camera_pose(det)
+        self.set_pose(R, t)
+
+        xyz_cam         = self.transform(pc[:, :3])
+        _, frustum_mask = self.filter_frustum(xyz_cam)
+        xyz_frustum     = xyz_cam[frustum_mask]
+        extra_frustum   = pc[frustum_mask, 3:]
+        result          = np.concatenate([xyz_frustum, extra_frustum], axis=1)
+
+        if occlusion:
+            _, occ_mask = self.cull_occlusion(xyz_frustum)
+            result      = result[occ_mask]
+
+        if result.shape[1] == 6:
+            result = np.concatenate(
+                [result, np.zeros((len(result), 1), dtype=np.float32)], axis=1
+            )
+
+        if len(result) == 0:
+            return np.zeros((1024, 7), dtype=np.float32), det
+
+        idx = np.round(np.linspace(0, len(result) - 1, 1024)).astype(int)
+        return result[idx], det
+
     def process_episode(self) -> np.ndarray | None:
         N         = self.rgbd.num_frames
         pc_arrays = np.zeros((N, 1024, 7), dtype=np.float32)
 
-        # Pre-compute temporally consistent label maps for the full episode.
-        if self.segmentation is not None:
-            label_maps = self.segmentation.segment_video(self.rgbd.color_frames)
-        else:
-            label_maps = [None] * N
-
         prev_det = None
         for index in range(N):
-            label_map = label_maps[index]
+            # Per-frame segmentation — same model and approach used at runtime.
+            if self.segmentation is not None:
+                rgb, _ = self.rgbd.get_frame(index)
+                label_map = self.segmentation.segment(rgb)
+            else:
+                label_map = None
 
             pc  = self.rgbd.get_pointcloud(index, label_map=label_map)  # (N,6) or (N,7)
             det = self.tracker.detect_plane(index)
@@ -457,7 +541,15 @@ def main():
         )
     )
 
-    seg = Segmentation()  # loaded once; reused across all episodes
+    seg = Segmentation(
+        model_path="mobile_sam.pt",  # MobileSAM — matches policy_runtime
+        points_per_side=16,
+        points_per_batch=128,
+        pred_iou_thresh=0.88,
+        stability_score_thresh=0.95,
+        min_mask_region_area=100,
+        crop_n_layers=0,
+    )
 
     for episode in episodes:
         print(f"\n=== Processing {episode} ===")
