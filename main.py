@@ -479,6 +479,76 @@ class Ext2Ego:
 
         return pc_arrays
 
+    def process_episode_ext(self, segmentation: Segmentation | None = None) -> np.ndarray | None:
+        """Build a (N, 1024, 6) external-frame RGB point cloud for every frame.
+
+        No coordinate transform, frustum culling, or ArUco detection is
+        performed — each frame's full scene point cloud is uniformly decimated
+        to exactly 1024 points and stored as xyzrgb.
+
+        Args:
+            segmentation: Reserved for future use; passing a value raises
+                          NotImplementedError.
+
+        Returns:
+            (N, 1024, 6) float32 xyzrgb array, or None on failure.
+        """
+        if segmentation is not None:
+            raise NotImplementedError("Segmentation support is not yet implemented for process_episode_ext.")
+
+        N = self.rgbd.num_frames
+        pc_arrays = np.zeros((N, 1024, 6), dtype=np.float32)
+
+        for index in range(N):
+            pc = self.rgbd.get_pointcloud(index, label_map=None, num_pts=1024)  # (1024, 6) xyzrgb
+            pc_arrays[index] = pc[:, :6]
+
+        return pc_arrays
+
+    def save_processed_ext_no_seg(self, pc_arrays: np.ndarray) -> str:
+        """Save external-frame (no-seg) episode data to a new zarr folder.
+
+        The output folder has the same name as the input with
+        '_processed_ext_no_seg' inserted before '.zarr'.  Actions,
+        observations, and metadata are copied from the source episode as-is.
+
+        Args:
+            pc_arrays: (N, 1024, 6) float32 array from process_episode_ext().
+
+        Returns:
+            Path to the written zarr folder.
+        """
+        src = self.rgbd.folder
+        base = src[:-5] if src.endswith(".zarr") else src
+        dst  = base + "_processed_ext_no_seg.zarr"
+
+        src_root = zarr.open(src, mode='r')
+
+        zarr.open_array(
+            os.path.join(dst, "pointcloud"),
+            mode='w', shape=pc_arrays.shape,
+            dtype=np.float32, chunks=(1, 1024, 6),
+        )[:] = pc_arrays
+
+        for group_name in ("actions", "observations"):
+            if group_name not in src_root:
+                continue
+            for key in src_root[group_name]:
+                data = np.asarray(src_root[group_name][key])
+                zarr.open_array(
+                    os.path.join(dst, group_name, key),
+                    mode='w', shape=data.shape,
+                    dtype=data.dtype, chunks=(1,) + data.shape[1:],
+                )[:] = data
+
+        for fname in ("metadata.json", "metadata.npz"):
+            src_file = os.path.join(src, fname)
+            if os.path.exists(src_file):
+                shutil.copy2(src_file, os.path.join(dst, fname))
+
+        print(f"Saved: {dst}")
+        return dst
+
     def save_processed(self, pc_arrays: np.ndarray) -> str:
         """Save processed episode data to a new zarr folder.
 
@@ -541,26 +611,26 @@ def main():
         )
     )
 
-    seg = Segmentation(
-        model_path="mobile_sam.pt",  # MobileSAM — matches policy_runtime
-        points_per_side=16,
-        points_per_batch=128,
-        pred_iou_thresh=0.88,
-        stability_score_thresh=0.95,
-        min_mask_region_area=100,
-        crop_n_layers=0,
-    )
+    # seg = Segmentation(
+    #     model_path="mobile_sam.pt",  # MobileSAM — matches policy_runtime
+    #     points_per_side=16,
+    #     points_per_batch=128,
+    #     pred_iou_thresh=0.88,
+    #     stability_score_thresh=0.95,
+    #     min_mask_region_area=100,
+    #     crop_n_layers=0,
+    # )
 
     for episode in episodes:
         print(f"\n=== Processing {episode} ===")
         data     = RGBDData(episode)
         tracker  = ArucoTracker(data)
-        pipeline = Ext2Ego(data, tracker, "config/camera.yaml", seg)
-        ret = pipeline.process_episode()
+        pipeline = Ext2Ego(data, tracker, "config/camera.yaml")
+        ret = pipeline.process_episode_ext()
         if ret is None:
             print(f"  SKIP: episode cannot be processed.")
         else:
-            pipeline.save_processed(ret)
+            pipeline.save_processed_ext_no_seg(ret)
 
 if __name__ == "__main__":
     main()
