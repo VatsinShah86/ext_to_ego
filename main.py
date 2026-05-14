@@ -7,7 +7,7 @@ import cv2
 import zarr
 from scipy.spatial import cKDTree
 from vision import RGBDData, ArucoTracker, MarkerDetection
-from segmentation import Segmentation
+from realtime_segmentation import RealtimeSegmentation
 
 
 def create_example_pc(density: float = 10):
@@ -160,7 +160,7 @@ class Ext2Ego:
     """
 
     def __init__(self, rgbd: RGBDData | None, tracker: ArucoTracker, config_path: str,
-                 segmentation: Segmentation | None = None):
+                 segmentation: RealtimeSegmentation | None = None):
         self.rgbd         = rgbd
         self.tracker      = tracker
         self.segmentation = segmentation
@@ -280,13 +280,19 @@ class Ext2Ego:
         or (M, 7) xyzrgb+seg_id array in ego camera frame, and det is the
         MarkerDetection used to derive the ego camera pose (None if not found).
         """
-        rgb, _    = self.rgbd.get_frame(index)
-        label_map = self.segmentation.segment(rgb) if self.segmentation is not None else None
+        color_rgb, depth_m = self.rgbd.get_frame(index)
+        label_map = None
+        if self.segmentation is not None:
+            label_map, _ = self.segmentation.process_frame(color_rgb)
 
-        pc  = self.rgbd.get_pointcloud(index, label_map=label_map)  # (N,6) or (N,7)
+        pc  = RGBDData.get_pointcloud_from_arrays(
+            color_rgb, depth_m,
+            self.tracker.camera_matrix, self.tracker.dist_coeffs,
+            label_map=label_map,
+        )
         det = self.tracker.detect_plane(index)
+        self.rgbd.plot_pointcloud(index, label_map=label_map)
 
-        self.rgbd.plot_pointcloud(index, label_map = label_map)
         n_extra = pc.shape[1] - 6  # 0 without seg, 1 with
         if det is None:
             return np.empty((0, 6 + n_extra), dtype=np.float32), None
@@ -327,16 +333,14 @@ class Ext2Ego:
         """
         if self.segmentation is None:
             return None
-        rgb, _ = self.rgbd.get_frame(index)
+        color_rgb, _ = self.rgbd.get_frame(index)
         corners = prev_det.corners                          # (4, 2) float32
         pad = 5.0
         bbox = np.array([
-            corners[:, 0].min() - pad,
-            corners[:, 1].min() - pad,
-            corners[:, 0].max() + pad,
-            corners[:, 1].max() + pad,
+            corners[:, 0].min() - pad, corners[:, 1].min() - pad,
+            corners[:, 0].max() + pad, corners[:, 1].max() + pad,
         ])
-        mask = self.segmentation.segment_with_bbox(rgb, bbox)
+        mask = self.segmentation.segment_box(color_rgb, bbox)
         if not mask.any():
             return None
         return self.tracker.detect_plane_from_mask(index, mask, prev_det)
@@ -353,7 +357,7 @@ class Ext2Ego:
             corners[:, 0].min() - pad, corners[:, 1].min() - pad,
             corners[:, 0].max() + pad, corners[:, 1].max() + pad,
         ])
-        mask = self.segmentation.segment_with_bbox(color_rgb, bbox)
+        mask = self.segmentation.segment_box(color_rgb, bbox)
         if not mask.any():
             return None
         return self.tracker.detect_plane_from_mask_frame(depth_m, mask, prev_det)
@@ -381,7 +385,7 @@ class Ext2Ego:
             Returns (zeros, None) if marker detection fails completely.
         """
         if label_map is None and self.segmentation is not None:
-            label_map = self.segmentation.segment(color_rgb)
+            label_map, _ = self.segmentation.process_frame(color_rgb)
 
         pc  = RGBDData.get_pointcloud_from_arrays(
             color_rgb, depth_m,
@@ -432,14 +436,16 @@ class Ext2Ego:
 
         prev_det = None
         for index in range(N):
-            # Per-frame segmentation — same model and approach used at runtime.
+            color_rgb, depth_m = self.rgbd.get_frame(index)
+            label_map = None
             if self.segmentation is not None:
-                rgb, _ = self.rgbd.get_frame(index)
-                label_map = self.segmentation.segment(rgb)
-            else:
-                label_map = None
+                label_map, _ = self.segmentation.process_frame(color_rgb)
 
-            pc  = self.rgbd.get_pointcloud(index, label_map=label_map)  # (N,6) or (N,7)
+            pc  = RGBDData.get_pointcloud_from_arrays(
+                color_rgb, depth_m,
+                self.tracker.camera_matrix, self.tracker.dist_coeffs,
+                label_map=label_map,
+            )
             det = self.tracker.detect_plane(index)
 
             if det is not None:
@@ -479,29 +485,63 @@ class Ext2Ego:
 
         return pc_arrays
 
-    def process_episode_ext(self, segmentation: Segmentation | None = None) -> np.ndarray | None:
-        """Build a (N, 1024, 6) external-frame RGB point cloud for every frame.
+    def process_live_ext(
+        self,
+        color_rgb: np.ndarray,
+        depth_m: np.ndarray,
+    ) -> np.ndarray:
+        """Process a single live RGBD frame into an external-frame point cloud.
 
-        No coordinate transform, frustum culling, or ArUco detection is
-        performed — each frame's full scene point cloud is uniformly decimated
-        to exactly 1024 points and stored as xyzrgb.
+        No coordinate transform, frustum culling, or ArUco detection.
+        Uses self.segmentation when set; call seg.reset() before a new sequence.
 
         Args:
-            segmentation: Reserved for future use; passing a value raises
-                          NotImplementedError.
+            color_rgb: (H, W, 3) uint8 RGB — convert from RealSense BGR before calling.
+            depth_m:   (H, W) float32 depth in metres, aligned to colour.
 
         Returns:
-            (N, 1024, 6) float32 xyzrgb array, or None on failure.
+            (1024, 6) float32 xyzrgb        — when self.segmentation is None.
+            (1024, 7) float32 xyzrgb+seg_id — when self.segmentation is set.
         """
-        if segmentation is not None:
-            raise NotImplementedError("Segmentation support is not yet implemented for process_episode_ext.")
+        label_map = None
+        if self.segmentation is not None:
+            label_map, _ = self.segmentation.process_frame(color_rgb)
 
+        return RGBDData.get_pointcloud_from_arrays(
+            color_rgb, depth_m,
+            self.tracker.camera_matrix,
+            self.tracker.dist_coeffs,
+            label_map=label_map,
+            num_pts=1024,
+        )
+
+    def process_episode_ext(self) -> np.ndarray | None:
+        """Build an external-frame point cloud for every frame in the episode.
+
+        No coordinate transform, frustum culling, or ArUco detection is
+        performed — each frame's point cloud is uniformly decimated to exactly
+        1024 points.  Uses self.segmentation when set; call seg.reset() before
+        starting a new episode.
+
+        Returns:
+            (N, 1024, 6) float32 xyzrgb        — when self.segmentation is None.
+            (N, 1024, 7) float32 xyzrgb+seg_id — when self.segmentation is set.
+        """
         N = self.rgbd.num_frames
-        pc_arrays = np.zeros((N, 1024, 6), dtype=np.float32)
+        n_cols = 7 if self.segmentation is not None else 6
+        pc_arrays = np.zeros((N, 1024, n_cols), dtype=np.float32)
 
         for index in range(N):
-            pc = self.rgbd.get_pointcloud(index, label_map=None, num_pts=1024)  # (1024, 6) xyzrgb
-            pc_arrays[index] = pc[:, :6]
+            color_rgb, depth_m = self.rgbd.get_frame(index)
+            label_map = None
+            if self.segmentation is not None:
+                label_map, _ = self.segmentation.process_frame(color_rgb)
+            pc = RGBDData.get_pointcloud_from_arrays(
+                color_rgb, depth_m,
+                self.tracker.camera_matrix, self.tracker.dist_coeffs,
+                label_map=label_map, num_pts=1024,
+            )
+            pc_arrays[index] = pc
 
         return pc_arrays
 
@@ -528,6 +568,50 @@ class Ext2Ego:
             os.path.join(dst, "pointcloud"),
             mode='w', shape=pc_arrays.shape,
             dtype=np.float32, chunks=(1, 1024, 6),
+        )[:] = pc_arrays
+
+        for group_name in ("actions", "observations"):
+            if group_name not in src_root:
+                continue
+            for key in src_root[group_name]:
+                data = np.asarray(src_root[group_name][key])
+                zarr.open_array(
+                    os.path.join(dst, group_name, key),
+                    mode='w', shape=data.shape,
+                    dtype=data.dtype, chunks=(1,) + data.shape[1:],
+                )[:] = data
+
+        for fname in ("metadata.json", "metadata.npz"):
+            src_file = os.path.join(src, fname)
+            if os.path.exists(src_file):
+                shutil.copy2(src_file, os.path.join(dst, fname))
+
+        print(f"Saved: {dst}")
+        return dst
+
+    def save_processed_ext_seg(self, pc_arrays: np.ndarray) -> str:
+        """Save external-frame (seg) episode data to a new zarr folder.
+
+        The output folder has the same name as the input with
+        '_processed_ext_seg' inserted before '.zarr'.  Actions,
+        observations, and metadata are copied from the source episode as-is.
+
+        Args:
+            pc_arrays: (N, 1024, 7) float32 array from process_episode_ext().
+
+        Returns:
+            Path to the written zarr folder.
+        """
+        src = self.rgbd.folder
+        base = src[:-5] if src.endswith(".zarr") else src
+        dst  = base + "_processed_ext_seg.zarr"
+
+        src_root = zarr.open(src, mode='r')
+
+        zarr.open_array(
+            os.path.join(dst, "pointcloud"),
+            mode='w', shape=pc_arrays.shape,
+            dtype=np.float32, chunks=(1, 1024, 7),
         )[:] = pc_arrays
 
         for group_name in ("actions", "observations"):
@@ -611,26 +695,19 @@ def main():
         )
     )
 
-    # seg = Segmentation(
-    #     model_path="mobile_sam.pt",  # MobileSAM — matches policy_runtime
-    #     points_per_side=16,
-    #     points_per_batch=128,
-    #     pred_iou_thresh=0.88,
-    #     stability_score_thresh=0.95,
-    #     min_mask_region_area=100,
-    #     crop_n_layers=0,
-    # )
+    seg = RealtimeSegmentation()   # load GDINO + SAM 2 weights once for all episodes
 
     for episode in episodes:
         print(f"\n=== Processing {episode} ===")
+        seg.reset()
         data     = RGBDData(episode)
         tracker  = ArucoTracker(data)
-        pipeline = Ext2Ego(data, tracker, "config/camera.yaml")
+        pipeline = Ext2Ego(data, tracker, "config/camera.yaml", segmentation=seg)
         ret = pipeline.process_episode_ext()
         if ret is None:
             print(f"  SKIP: episode cannot be processed.")
         else:
-            pipeline.save_processed_ext_no_seg(ret)
+            pipeline.save_processed_ext_seg(ret)
 
 if __name__ == "__main__":
     main()

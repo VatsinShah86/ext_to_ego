@@ -1,14 +1,19 @@
 """
-Text-prompted initialization (YOLOWorld) + SAM 2 temporal tracking.
+Text-prompted initialization (Grounding DINO) + SAM 2 temporal tracking.
 
-Mirrors the architecture in realtime_segmentation_doc.md but substitutes
-YOLOWorld for Grounding DINO — same open-vocabulary detection capability,
-already present in the venv via ultralytics.
+Implements the architecture in realtime_segmentation_doc.md exactly:
+  Frame 0         — Grounding DINO converts the text prompt to bounding boxes;
+                    SAM 2 image predictor turns each box into a precise mask.
+  Frames 1..N     — SAM 2 image predictor tracks each object via its previous
+                    mask bounding box (live mode) or the video predictor with
+                    full temporal memory (episodic mode).
+  Confidence gate — low SAM 2 IOU or periodic REPROMPT_EVERY interval triggers
+                    a fresh Grounding DINO detection.
 
 Label assignment (fixed):
     0  background
     1  rope
-    2  robot gripper
+    2  orange gripper fingers
     3  table surface
 
 Outputs (H, W) int32 label maps compatible with:
@@ -18,16 +23,14 @@ Outputs (H, W) int32 label maps compatible with:
 Two modes
 ---------
 Live / streaming
-    Call reset() before a new sequence, then process_frame() once per
-    camera frame.  Uses SAM 2 image predictor with box prompts — truly
-    frame-by-frame with no buffering required.  YOLOWorld re-prompts on
-    confidence drop or at REPROMPT_EVERY-frame intervals; between reprompts
-    the previous mask's bounding box is the SAM 2 prompt.
+    Call reset() before a new sequence, then process_frame() once per camera
+    frame.  Grounding DINO re-prompts on low confidence or every REPROMPT_EVERY
+    frames; between reprompts the previous mask's bounding box guides SAM 2.
 
 Episodic
     Call process_episode(rgbd) or process_episode_as_arrays(rgbd).
     Uses SAM 2 video predictor for full temporal memory within each chunk,
-    with YOLOWorld re-prompting at chunk boundaries aligned to REPROMPT_EVERY.
+    with Grounding DINO re-prompting at chunk boundaries aligned to REPROMPT_EVERY.
 
 Timing
     Every internal operation appends to self.timing (lists of ms values).
@@ -38,63 +41,101 @@ import os
 import tempfile
 import time
 
+import groundingdino.datasets.transforms as GDT
 import numpy as np
 import torch
-from PIL import Image
-from ultralytics import YOLOWorld
+from PIL import Image as PILImage
+
+import groundingdino
+from groundingdino.util.inference import load_model, predict as gdino_predict
 
 
-CLASSES = ["rope", "robot gripper", "table surface"]
+# ── Class / label constants ────────────────────────────────────────────────
+
+CLASSES = ["rope", "orange gripper fingers", "table surface"]
 LABEL_IDS: dict[str, int] = {c: i + 1 for i, c in enumerate(CLASSES)}
-# rope → 1 · robot gripper → 2 · table surface → 3
+# rope → 1 · orange gripper fingers → 2 · table surface → 3
+
+TEXT_PROMPT = "rope . orange gripper fingers . table surface"
 
 _LABEL_COLORS = {
-    1: (0.95, 0.25, 0.25),   # rope       — red
-    2: (0.25, 0.95, 0.35),   # gripper    — green
-    3: (0.25, 0.45, 1.00),   # table      — blue
+    1: (0.95, 0.25, 0.25),   # rope                  — red
+    2: (0.25, 0.95, 0.35),   # orange gripper fingers — green
+    3: (0.25, 0.45, 1.00),   # table surface          — blue
 }
-_LABEL_NAMES = {0: "background", 1: "rope", 2: "gripper", 3: "table"}
+_LABEL_NAMES = {
+    0: "background",
+    1: "rope",
+    2: "gripper",
+    3: "table",
+}
 
-_DEFAULT_YOLOWORLD = "yolov8s-worldv2.pt"
+# ── Grounding DINO defaults ────────────────────────────────────────────────
+
+_DEFAULT_GDINO_CFG = os.path.join(
+    os.path.dirname(groundingdino.__file__),
+    "config", "GroundingDINO_SwinT_OGC.py",
+)
+_DEFAULT_GDINO_CKPT = "groundingdino_swint_ogc.pth"
+
+# Standard GDINO preprocessing transform (mirrors load_image internals)
+_GDINO_TRANSFORM = GDT.Compose([
+    GDT.RandomResize([800], max_size=1333),
+    GDT.ToTensor(),
+    GDT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+# ── SAM 2 defaults ─────────────────────────────────────────────────────────
+
 _DEFAULT_SAM2_CFG  = "configs/sam2.1/sam2.1_hiera_t.yaml"
 _DEFAULT_SAM2_CKPT = "sam2.1_t.pt"
 
 
 class RealtimeSegmentation:
-    """Text-prompted init (YOLOWorld) + SAM 2 temporal tracking.
+    """Grounding DINO init + SAM 2 temporal tracking.
 
     Parameters
     ----------
-    yoloworld_ckpt  : YOLOWorld model file (auto-downloaded if absent).
-    sam2_cfg        : SAM 2 Hydra config name (relative to sam2 package).
-    sam2_ckpt       : SAM 2 checkpoint path.
-    box_threshold   : YOLOWorld confidence cutoff.  Lower → more detections.
-    confidence_floor: SAM 2 IOU score below which a live-mode reprompt fires.
-    reprompt_every  : Force YOLOWorld reprompt every N frames.
-    device          : "cuda" / "cpu" (auto-detected if None).
+    gdino_cfg        : Path to GroundingDINO config (defaults to bundled SwinT).
+    gdino_ckpt       : Path to GroundingDINO checkpoint.
+    sam2_cfg         : SAM 2 Hydra config name (relative to sam2 package).
+    sam2_ckpt        : SAM 2 checkpoint path.
+    box_threshold    : GDINO box confidence cutoff.  Lower → more detections.
+    text_threshold   : GDINO per-token text match threshold.
+    confidence_floor : SAM 2 IOU score below which a live-mode reprompt fires.
+    reprompt_every   : Force Grounding DINO reprompt every N frames (~10 s at 15 Hz).
+    device           : "cuda" / "cpu" (auto-detected if None).
     """
 
     def __init__(
         self,
-        yoloworld_ckpt: str = _DEFAULT_YOLOWORLD,
+        gdino_cfg: str = _DEFAULT_GDINO_CFG,
+        gdino_ckpt: str = _DEFAULT_GDINO_CKPT,
         sam2_cfg: str = _DEFAULT_SAM2_CFG,
         sam2_ckpt: str = _DEFAULT_SAM2_CKPT,
         box_threshold: float = 0.35,
+        text_threshold: float = 0.25,
         confidence_floor: float = 0.70,
         reprompt_every: int = 150,
         device: str | None = None,
     ):
         self.box_threshold    = box_threshold
+        self.text_threshold   = text_threshold
         self.confidence_floor = confidence_floor
         self.reprompt_every   = reprompt_every
         self.device           = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self._sam2_cfg  = sam2_cfg
-        self._sam2_ckpt = sam2_ckpt
+        self._gdino_cfg  = gdino_cfg
+        self._gdino_ckpt = gdino_ckpt
+        self._sam2_cfg   = sam2_cfg
+        self._sam2_ckpt  = sam2_ckpt
 
-        # YOLOWorld — open-vocab text → boxes, replaces Grounding DINO
-        self._detector = YOLOWorld(yoloworld_ckpt)
-        self._detector.set_classes(CLASSES)
+        print(f"[GDINO] config : {gdino_cfg}")
+        print(f"[GDINO] ckpt   : {gdino_ckpt}")
+
+        # Grounding DINO — loaded eagerly (small model, ~150 MB)
+        self._detector = load_model(gdino_cfg, gdino_ckpt, device=self.device)
+        self._detector.eval()
 
         # Lazy-loaded SAM 2 predictors (loaded on first use)
         self._image_predictor = None   # SAM2ImagePredictor  (live mode)
@@ -107,13 +148,14 @@ class RealtimeSegmentation:
 
         # Timing accumulators (ms)
         self.timing: dict[str, list[float]] = {
-            "detect_ms":      [],   # one entry per YOLOWorld call
+            "detect_ms":      [],   # one entry per Grounding DINO call
             "sam2_image_ms":  [],   # one entry per process_frame() call
             "sam2_video_ms":  [],   # one entry per _propagate_chunk() call
             "frame_total_ms": [],   # end-to-end per process_frame() call
         }
+        self._chunk_sizes: list[int] = []
 
-    # ── Lazy model loaders ─────────────────────────────────────────────────
+    # ── Lazy SAM 2 loaders ─────────────────────────────────────────────────
 
     def _get_image_predictor(self):
         if self._image_predictor is None:
@@ -133,31 +175,96 @@ class RealtimeSegmentation:
 
     # ── Detection ──────────────────────────────────────────────────────────
 
-    def _detect_boxes(self, frame_rgb: np.ndarray) -> dict[str, np.ndarray]:
-        """Run YOLOWorld; return the highest-confidence box per class.
+    @staticmethod
+    def _phrase_to_label(phrase: str) -> str | None:
+        """Map a Grounding DINO output phrase to one of the three fixed class labels.
 
-        Returns {label: (4,) float32 xyxy}.  Missing key = class not found.
-        Appends to self.timing["detect_ms"].
+        Tries exact match first, then substring containment in either direction.
+        Returns None if no class matches.
+        """
+        phrase = phrase.lower().strip()
+        for cls in CLASSES:
+            if cls == phrase or cls in phrase or phrase in cls:
+                return cls
+        return None
+
+    def _detect_boxes(self, frame_rgb: np.ndarray) -> dict[str, np.ndarray]:
+        """Run Grounding DINO; return the highest-confidence box per class.
+
+        Args:
+            frame_rgb: (H, W, 3) uint8 RGB image.
+
+        Returns:
+            {label: (4,) float32 xyxy pixels}.  Missing key = class not detected.
+        Appends detection wall-time to self.timing["detect_ms"].
         """
         t0 = time.perf_counter()
+        H, W = frame_rgb.shape[:2]
 
-        results   = self._detector.predict(frame_rgb, verbose=False, conf=self.box_threshold)
-        boxes     = results[0].boxes.xyxy.cpu().numpy()
-        scores    = results[0].boxes.conf.cpu().numpy()
-        class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+        # PIL image → normalised tensor (mirrors GDINO's load_image internals)
+        pil_img = PILImage.fromarray(frame_rgb)
+        image_tensor, _ = _GDINO_TRANSFORM(pil_img, None)
+        image_tensor = image_tensor.to(self.device)
 
+        with torch.no_grad():
+            boxes_norm, logits, phrases = gdino_predict(
+                model=self._detector,
+                image=image_tensor,
+                caption=TEXT_PROMPT,
+                box_threshold=self.box_threshold,
+                text_threshold=self.text_threshold,
+                device=self.device,
+            )
+        # boxes_norm: (N, 4) cxcywh normalised [0, 1]
+        # logits:     (N,)   detection confidence
+        # phrases:    list[str] matched text tokens
+
+        # Convert cxcywh normalised → xyxy pixels
+        if len(boxes_norm) > 0:
+            cx, cy, bw, bh = boxes_norm[:, 0], boxes_norm[:, 1], boxes_norm[:, 2], boxes_norm[:, 3]
+            boxes_xyxy = torch.stack([
+                (cx - bw / 2) * W,
+                (cy - bh / 2) * H,
+                (cx + bw / 2) * W,
+                (cy + bh / 2) * H,
+            ], dim=1).cpu().numpy()
+            scores = logits.cpu().numpy()
+        else:
+            boxes_xyxy = np.empty((0, 4), dtype=np.float32)
+            scores     = np.empty((0,),   dtype=np.float32)
+
+        # Map phrases → class labels; keep top-1 per class
         best: dict[str, tuple[np.ndarray, float]] = {}
-        for box, score, cid in zip(boxes, scores, class_ids):
-            if cid >= len(CLASSES):
+        for box, score, phrase in zip(boxes_xyxy, scores, phrases):
+            label = self._phrase_to_label(phrase)
+            if label is None:
                 continue
-            label = CLASSES[cid]
             if label not in best or score > best[label][1]:
-                best[label] = (box, float(score))
+                best[label] = (box.astype(np.float32), float(score))
 
         self.timing["detect_ms"].append((time.perf_counter() - t0) * 1e3)
         return {label: v[0] for label, v in best.items()}
 
-    # ── SAM 2 image predictor (live mode) ──────────────────────────────────
+    def segment_box(self, frame_rgb: np.ndarray, box_xyxy: np.ndarray) -> np.ndarray:
+        """Segment a single region using SAM 2 image predictor + a box prompt.
+
+        Used as a targeted fallback (e.g. ArUco recovery) without touching the
+        live-mode state (frame counter, reprompt schedule, stored masks).
+
+        Args:
+            frame_rgb: (H, W, 3) uint8 RGB.
+            box_xyxy:  (4,) float32 [x_min, y_min, x_max, y_max] in pixels.
+
+        Returns:
+            (H, W) bool mask.
+        """
+        predictor = self._get_image_predictor()
+        with torch.inference_mode():
+            predictor.set_image(frame_rgb)
+            masks, _, _ = predictor.predict(box=box_xyxy, multimask_output=False)
+        return masks[0].astype(bool)
+
+    # ── SAM 2 image predictor ──────────────────────────────────────────────
 
     def _sam2_predict_boxes(
         self,
@@ -202,7 +309,7 @@ class RealtimeSegmentation:
         """
         H, W = frame_shape[:2]
         lm = np.zeros((H, W), dtype=np.int32)
-        for label in ["table surface", "robot gripper", "rope"]:
+        for label in ["table surface", "orange gripper fingers", "rope"]:
             if label in masks_by_label:
                 lm[masks_by_label[label]] = LABEL_IDS[label]
         return lm
@@ -218,23 +325,24 @@ class RealtimeSegmentation:
         cmin, cmax = np.where(cols)[0][[0, -1]]
         return np.array([cmin, rmin, cmax, rmax], dtype=np.float32)
 
-    # ── Timing helpers ──────────────────────────────────────────────────────
+    # ── Timing helpers ─────────────────────────────────────────────────────
 
     def clear_timing(self) -> None:
         """Clear all accumulated timing data."""
         for v in self.timing.values():
             v.clear()
+        self._chunk_sizes.clear()
 
     def timing_report(self) -> None:
         """Print a formatted timing summary to stdout."""
         def _fmt(vals: list[float], label: str) -> str:
             if not vals:
-                return f"  {label:<30s}  no data"
+                return f"  {label:<32s}  no data"
             return (
-                f"  {label:<30s}"
-                f"  mean={np.mean(vals):6.1f} ms"
-                f"  min={np.min(vals):6.1f} ms"
-                f"  max={np.max(vals):6.1f} ms"
+                f"  {label:<32s}"
+                f"  mean={np.mean(vals):7.1f} ms"
+                f"  min={np.min(vals):7.1f} ms"
+                f"  max={np.max(vals):7.1f} ms"
                 f"  n={len(vals)}"
             )
 
@@ -243,24 +351,24 @@ class RealtimeSegmentation:
         vid   = self.timing["sam2_video_ms"]
         total = self.timing["frame_total_ms"]
 
-        print("\n─── Timing report ───────────────────────────────────────────────")
-        print(_fmt(det,   "YOLOWorld detection"))
+        print("\n─── Timing report ───────────────────────────────────────────────────")
+        print(_fmt(det,   "Grounding DINO detection"))
         print(_fmt(img,   "SAM 2 image predict (live)"))
-        if vid:
+        if vid and self._chunk_sizes:
             per_frame = [v / c for v, c in zip(vid, self._chunk_sizes)]
             print(_fmt(vid,       "SAM 2 video propagation (chunk)"))
             print(_fmt(per_frame, "  ↳ per frame"))
         print(_fmt(total, "Live mode end-to-end"))
         if total:
             fps = 1000.0 / np.mean(total)
-            print(f"  {'Effective live FPS':<30s}  {fps:.1f} Hz")
-        print("─────────────────────────────────────────────────────────────────")
+            print(f"  {'Effective live FPS':<32s}  {fps:.1f} Hz")
+        print("─────────────────────────────────────────────────────────────────────")
 
     # ── Live / streaming mode ──────────────────────────────────────────────
 
     def reset(self) -> None:
         """Reset streaming state.  Call before starting a new sequence."""
-        self._frame_idx      = 0
+        self._frame_idx       = 0
         self._masks_by_label  = {}
         self._scores_by_label = {}
 
@@ -337,7 +445,7 @@ class RealtimeSegmentation:
         t0 = time.perf_counter()
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, frame in enumerate(frames):
-                Image.fromarray(frame).save(os.path.join(tmpdir, f"{i:05d}.jpg"))
+                PILImage.fromarray(frame).save(os.path.join(tmpdir, f"{i:05d}.jpg"))
 
             with torch.inference_mode():
                 state = predictor.init_state(
@@ -356,8 +464,6 @@ class RealtimeSegmentation:
                     label_maps[frame_idx] = lm
 
         self.timing["sam2_video_ms"].append((time.perf_counter() - t0) * 1e3)
-        if not hasattr(self, "_chunk_sizes"):
-            self._chunk_sizes = []
         self._chunk_sizes.append(N)
         return label_maps
 
@@ -368,15 +474,14 @@ class RealtimeSegmentation:
     ) -> list[np.ndarray]:
         """Process all frames of an episode with SAM 2 temporal propagation.
 
-        YOLOWorld initializes frame 0 and re-prompts at every REPROMPT_EVERY-
-        aligned chunk boundary.  Between reprompts, the last frame of each
-        chunk seeds the next, preserving SAM 2 temporal memory across chunks.
+        Grounding DINO initialises frame 0 and re-prompts at every
+        REPROMPT_EVERY-aligned chunk boundary.  Between reprompts the last
+        frame of each chunk seeds the next, preserving temporal memory.
 
         Args:
             rgbd:       RGBDData instance — must expose get_frame(i) → (rgb, depth)
                         and the num_frames property.
-            chunk_size: Frames per SAM 2 video-predictor call.  Trade-off:
-                        smaller = less GPU RAM; larger = better temporal memory.
+            chunk_size: Frames per SAM 2 video-predictor call.
 
         Returns:
             List of N (H, W) int32 label maps, one per episode frame.
@@ -384,7 +489,6 @@ class RealtimeSegmentation:
         N = rgbd.num_frames
         all_maps: list[np.ndarray] = []
         seed_masks: dict[str, np.ndarray] = {}
-        self._chunk_sizes = []
 
         for chunk_start in range(0, N, chunk_size):
             chunk_end = min(chunk_start + chunk_size, N)
@@ -470,17 +574,17 @@ if __name__ == "__main__":
     rgbd = RGBDData(ep_path)
     print(f"Frames  : {rgbd.num_frames}")
 
-    # ── Build segmentor (lower threshold so we're more likely to detect all objects) ──
-    seg = RealtimeSegmentation(box_threshold=0.25)
+    # ── Build segmentor ─────────────────────────────────────────────────────
+    seg = RealtimeSegmentation()   # uses doc defaults: box=0.35, text=0.25
 
-    # ── Warmup: load models before timing ──────────────────────────────────
-    print("\nWarming up models…")
+    # ── Warmup: trigger model loads before timing ───────────────────────────
+    print("\nWarming up SAM 2…")
     _warmup_frame, _ = rgbd.get_frame(0)
     seg.process_frame(_warmup_frame)
     seg.reset()
     seg.clear_timing()
 
-    # ── Live-mode pass: process first TEST_N frames with full timing ────────
+    # ── Live-mode pass: first TEST_N frames with full timing ────────────────
     TEST_N = min(120, rgbd.num_frames)
     print(f"\nRunning live mode on frames 0–{TEST_N - 1}…")
 
@@ -503,13 +607,9 @@ if __name__ == "__main__":
     def _labels_found(lm: np.ndarray) -> list[str]:
         return [_LABEL_NAMES[lid] for lid in sorted(LABEL_IDS.values()) if (lm == lid).any()]
 
-    # Sort frames: prefer more objects, break ties by total mask area
     ranked = sorted(
         range(TEST_N),
-        key=lambda i: (
-            _object_count(label_maps[i]),
-            int((label_maps[i] > 0).sum()),
-        ),
+        key=lambda i: (_object_count(label_maps[i]), int((label_maps[i] > 0).sum())),
         reverse=True,
     )
 
@@ -519,12 +619,11 @@ if __name__ == "__main__":
     for idx in ranked:
         lm = label_maps[idx]
         new_ids = {lid for lid in LABEL_IDS.values() if (lm == lid).any()} - covered
-        if new_ids or (not shown):
+        if new_ids or not shown:
             shown.append(idx)
             covered |= new_ids
         if len(shown) == 4 and covered == set(LABEL_IDS.values()):
             break
-    # Fall back: just take the top-4 ranked frames if we didn't find ideal ones
     if len(shown) < 4:
         shown = ranked[:4]
     shown.sort()
@@ -536,7 +635,7 @@ if __name__ == "__main__":
     # ── Figure 1: per-object mask breakdown ────────────────────────────────
     # Layout: one row per selected frame, columns = [combined | rope | gripper | table]
     COL_LABELS = ["combined", "rope", "gripper", "table"]
-    COL_IDS    = [None, 1, 2, 3]          # None = all objects, else the label ID
+    COL_IDS    = [None, 1, 2, 3]
     n_rows, n_cols = len(shown), len(COL_LABELS)
 
     fig1, axes = plt.subplots(
@@ -555,28 +654,24 @@ if __name__ == "__main__":
             ax = axes[row, col]
 
             if lid is None:
-                # Combined: all three overlaid on RGB
-                img = _overlay_masks(frame_rgb, lm)
-                ax.imshow(img)
+                ax.imshow(_overlay_masks(frame_rgb, lm))
                 ax.set_title(f"frame {idx}\n{found}", fontsize=8)
             else:
-                # Individual mask: object pixels in its colour, rest dark grey
                 mask   = lm == lid
                 color  = np.array(_LABEL_COLORS[lid])
-                canvas = np.full((*frame_rgb.shape[:2], 3), 0.15)  # dark background
+                canvas = np.full((*frame_rgb.shape[:2], 3), 0.15)
                 base   = frame_rgb.astype(float) / 255.0
-                # blend: 55% original + 45% object colour inside mask
                 for c in range(3):
                     canvas[..., c] = np.where(
                         mask,
                         0.55 * base[..., c] + 0.45 * color[c],
                         0.15,
                     )
-                score_txt = f"{scores.get(CLASSES[lid - 1], 0):.2f}" if scores.get(CLASSES[lid - 1]) else "—"
-                present   = "✓" if mask.any() else "✗"
+                score_val = scores.get(CLASSES[lid - 1], 0.0)
+                score_txt = f"{score_val:.2f}" if score_val else "—"
                 ax.imshow(canvas)
                 ax.set_title(
-                    f"{col_label}  {present}\nIOU {score_txt}",
+                    f"{col_label}  {'✓' if mask.any() else '✗'}\nIOU {score_txt}",
                     fontsize=8,
                     color=_LABEL_COLORS[lid],
                 )
@@ -601,7 +696,8 @@ if __name__ == "__main__":
     fig2.suptitle("Per-frame timing (live mode)", fontsize=12)
 
     def _hist(ax, data, title, color, budget_ms=None):
-        ax.hist(data, bins=20, color=color, edgecolor="white", linewidth=0.4)
+        ax.hist(data, bins=max(5, len(data) // 3), color=color,
+                edgecolor="white", linewidth=0.4)
         ax.axvline(np.mean(data), color="black", linestyle="--", linewidth=1.2,
                    label=f"mean {np.mean(data):.1f} ms")
         if budget_ms:
@@ -612,9 +708,9 @@ if __name__ == "__main__":
         ax.set_ylabel("frames")
         ax.legend(fontsize=8)
 
-    _hist(axes2[0], det,   "YOLOWorld detection\n(reprompt frames only)", "#e07b54")
-    _hist(axes2[1], img,   "SAM 2 image predict\n(live, per frame)",      "#5b8dd9")
-    _hist(axes2[2], total, "End-to-end per frame\n(live mode)",            "#6dbf67", budget_ms=66)
+    _hist(axes2[0], det,   "Grounding DINO\n(reprompt frames only)", "#e07b54")
+    _hist(axes2[1], img,   "SAM 2 image predict\n(live, per frame)",  "#5b8dd9")
+    _hist(axes2[2], total, "End-to-end per frame\n(live mode)",        "#6dbf67", budget_ms=66)
 
     plt.tight_layout()
     fig2.savefig("segmentation_timing.png", dpi=120, bbox_inches="tight")

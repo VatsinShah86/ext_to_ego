@@ -118,8 +118,9 @@ class RGBDData:
         depth_m: np.ndarray,
         camera_matrix: np.ndarray,
         dist_coeffs: np.ndarray,
-        max_z: float = 10.0,
+        max_z: float = 2.0,
         label_map: np.ndarray | None = None,
+        num_pts: int | None = None,
     ) -> np.ndarray:
         """Build a point cloud from raw arrays without a stored episode.
 
@@ -136,13 +137,22 @@ class RGBDData:
         y = pts_norm[..., 1] * z
 
         valid = (z > 0) & (z <= max_z)
+        if label_map is not None:
+            valid &= (label_map > 0)
         xyz = np.stack([x, y, z], axis=-1)[valid]
         rgb = color_rgb[valid].astype(np.float32)
 
         if label_map is not None:
             seg_ids = label_map[valid].astype(np.float32).reshape(-1, 1)
-            return np.concatenate([xyz, rgb, seg_ids], axis=-1)
-        return np.concatenate([xyz, rgb], axis=-1)
+            pc = np.concatenate([xyz, rgb, seg_ids], axis=-1)
+        else:
+            pc = np.concatenate([xyz, rgb], axis=-1)
+
+        if num_pts is not None and len(pc) != num_pts:
+            idx = np.round(np.linspace(0, len(pc) - 1, num_pts)).astype(int)
+            pc = pc[idx]
+
+        return pc
 
     def get_pointcloud(self, index: int, max_z: float = 2.0,
                        label_map: np.ndarray | None = None, 
@@ -170,6 +180,8 @@ class RGBDData:
         y = pts_norm[..., 1] * z
 
         valid = (z > 0) & (z <= max_z)
+        if label_map is not None:
+            valid &= (label_map > 0)
         xyz = np.stack([x, y, z], axis=-1)[valid]
         rgb = color_rgb[valid].astype(np.float32)
 
