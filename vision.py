@@ -144,8 +144,9 @@ class RGBDData:
             return np.concatenate([xyz, rgb, seg_ids], axis=-1)
         return np.concatenate([xyz, rgb], axis=-1)
 
-    def get_pointcloud(self, index: int, max_z: float = 10.0,
-                       label_map: np.ndarray | None = None) -> np.ndarray:
+    def get_pointcloud(self, index: int, max_z: float = 2.0,
+                       label_map: np.ndarray | None = None, 
+                       num_pts: int | None = None) -> np.ndarray:
         """Return an (N, 6) or (N, 7) float32 array for valid depth pixels.
 
         Columns: x, y, z  (metres, camera space)
@@ -174,9 +175,15 @@ class RGBDData:
 
         if label_map is not None:
             seg_ids = label_map[valid].astype(np.float32).reshape(-1, 1)
-            return np.concatenate([xyz, rgb, seg_ids], axis=-1)
+            pc = np.concatenate([xyz, rgb, seg_ids], axis=-1)
+        else:
+            pc = np.concatenate([xyz, rgb], axis=-1)
 
-        return np.concatenate([xyz, rgb], axis=-1)
+        if num_pts is not None and len(pc) != num_pts:
+            idx = np.round(np.linspace(0, len(pc) - 1, num_pts)).astype(int)
+            pc = pc[idx]
+
+        return pc
 
     def plot_pointcloud(self, index: int, max_points: int = 30_000,
                         label_map: np.ndarray | None = None) -> None:
@@ -910,7 +917,7 @@ class ArucoTracker:
         plt.show()
 
 if __name__ == "__main__":
-    data = RGBDData("data/episode_20260507_231138.zarr")
+    data = RGBDData("data/episode_20260513_191311.zarr")
 
     # for i in range (10):
     #     data.plot_pointcloud(3*i)
@@ -926,14 +933,20 @@ if __name__ == "__main__":
     # print(f"detect(500) took {elapsed_ms:.3f} ms")
     
     # aruco_tracker.plot_pointcloud_with_marker(500, 0.5)
-    num_frames = data.num_frames
-    print(f"total frames: {num_frames}")
-    bad_det = 0
-    for i in range(num_frames):
-        det_plane = aruco_tracker.detect_plane(i)
-        if det_plane is None:
-            print(f"frame {i} has no aruco detected")
-            data.plot_frame(i)
-            bad_det+=1
+    # num_frames = data.num_frames
+    # print(f"total frames: {num_frames}")
+    # bad_det = 0
+    # for i in range(num_frames):
+    #     det_plane = aruco_tracker.detect_plane(i)
+    #     if det_plane is None:
+    #         print(f"frame {i} has no aruco detected")
+    #         data.plot_frame(i)
+    #         bad_det+=1
         
-    print(f"{bad_det} frames have no aruco markers")
+    # print(f"{bad_det} frames have no aruco markers")
+    from segmentation import Segmentation
+    rgb, _ = data.get_frame(0)
+    seg = Segmentation()
+    lm = seg.segment(rgb)
+    pc = data.get_pointcloud(0, label_map = lm, num_pts = 1024)
+    print(f"pc shape: {pc.shape}")
