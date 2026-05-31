@@ -11,5 +11,7 @@ wheels/
 *.pt
 data*/
 mobile_sam*
+videos/
+step_by_step_output/
 # Virtual environments
 .venv

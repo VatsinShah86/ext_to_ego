@@ -121,10 +121,19 @@ class RGBDData:
         max_z: float = 2.0,
         label_map: np.ndarray | None = None,
         num_pts: int | None = None,
+        label_percentages: dict[int, float] | None = None,
     ) -> np.ndarray:
         """Build a point cloud from raw arrays without a stored episode.
 
         depth_m must already be in metres.  Mirrors get_pointcloud() logic.
+
+        label_percentages maps label_id -> percentage of num_pts (values sum to 100).
+            When provided alongside label_map and num_pts, each label is sampled
+            to exactly its allocated count; labels with fewer raw points than
+            requested are upsampled by repetition.  Labels absent from the scene
+            (zero raw points) are filled with zeros.
+            When None, points are uniformly subsampled across all labels (existing
+            behaviour — use this for the ego pipeline).
         """
         h, w = depth_m.shape
         uu, vv = np.meshgrid(np.arange(w, dtype=np.float32),
@@ -148,9 +157,31 @@ class RGBDData:
         else:
             pc = np.concatenate([xyz, rgb], axis=-1)
 
-        if num_pts is not None and len(pc) != num_pts:
-            idx = np.round(np.linspace(0, len(pc) - 1, num_pts)).astype(int)
-            pc = pc[idx]
+        if num_pts is not None:
+            if label_percentages is not None and label_map is not None and len(pc) > 0:
+                # Stratified sampling: each label gets exactly its allocated share.
+                # The last label absorbs any rounding remainder so total == num_pts.
+                label_ids = list(label_percentages.keys())
+                pts_per_label: dict[int, int] = {}
+                assigned = 0
+                for lid in label_ids[:-1]:
+                    n = int(num_pts * label_percentages[lid] / 100)
+                    pts_per_label[lid] = n
+                    assigned += n
+                pts_per_label[label_ids[-1]] = num_pts - assigned
+
+                chunks = []
+                for lid, n in pts_per_label.items():
+                    label_pc = pc[pc[:, 6] == lid]
+                    if len(label_pc) == 0:
+                        chunks.append(np.zeros((n, pc.shape[1]), dtype=np.float32))
+                    else:
+                        idx = np.round(np.linspace(0, len(label_pc) - 1, n)).astype(int)
+                        chunks.append(label_pc[idx])
+                pc = np.concatenate(chunks, axis=0)
+            elif len(pc) != num_pts:
+                idx = np.round(np.linspace(0, len(pc) - 1, num_pts)).astype(int)
+                pc = pc[idx]
 
         return pc
 
@@ -929,14 +960,14 @@ class ArucoTracker:
         plt.show()
 
 if __name__ == "__main__":
-    data = RGBDData("data/episode_20260513_191311.zarr")
+    data = RGBDData("data/episode_20260519_193634.zarr")
 
     # for i in range (10):
     #     data.plot_pointcloud(3*i)
 
     # data.plot_frame(30)
     # data.plot_pointcloud(0, 300000)
-    aruco_tracker = ArucoTracker(data)
+    # aruco_tracker = ArucoTracker(data)
     # aruco_tracker.plot_frame(500)
     # data.plot_pointcloud(0, 100000)
     # start_ns = time.perf_counter_ns()
@@ -956,9 +987,83 @@ if __name__ == "__main__":
     #         bad_det+=1
         
     # print(f"{bad_det} frames have no aruco markers")
-    from segmentation import Segmentation
-    rgb, _ = data.get_frame(0)
-    seg = Segmentation()
-    lm = seg.segment(rgb)
-    pc = data.get_pointcloud(0, label_map = lm, num_pts = 1024)
-    print(f"pc shape: {pc.shape}")
+    # from segmentation import Segmentation
+    # rgb, _ = data.get_frame(0)
+    # seg = Segmentation()
+    # lm = seg.segment(rgb)
+    # pc = data.get_pointcloud(0, label_map = lm, num_pts = 1024)
+    # print(f"pc shape: {pc.shape}")
+
+    # color_rgb, depth_m = data.get_frame(0)
+    # label_map = None
+
+    # t0 = time.perf_counter()
+    # pc = data.get_pointcloud(
+    #         index = 0,
+    #         num_pts=1024,
+    #     )
+    # t1 = time.perf_counter()
+    # print(f"Time for pc: {t1-t0}")
+
+    # ── Test: label_percentages stratified sampling ───────────────────────
+    # Synthetic 100×100 grid = 10,000 pixels.  All depth valid; no background (label 0).
+    H, W = 100, 100
+    rng = np.random.default_rng(42)
+
+    depth_m   = np.ones((H, W), dtype=np.float32)
+    color_rgb = rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
+
+    # Simple pinhole camera — no distortion
+    camera_matrix = np.array([[500., 0., 50.], [0., 500., 50.], [0., 0., 1.]], dtype=np.float64)
+    dist_coeffs   = np.zeros(5, dtype=np.float64)
+
+    # Known label distribution: 5000 rope (1), 2500 gripper (2), 2500 table (3)
+    label_flat = np.array([1]*5000 + [2]*2500 + [3]*2500, dtype=np.int32)
+    rng.shuffle(label_flat)
+    label_map = label_flat.reshape(H, W)
+
+    num_pts = 1000
+    pct = {1: 90.0, 2: 5.0, 3: 5.0}
+
+    pc = RGBDData.get_pointcloud_from_arrays(
+        color_rgb, depth_m, camera_matrix, dist_coeffs,
+        label_map=label_map, num_pts=num_pts, label_percentages=pct,
+    )
+
+    n_rope    = int(num_pts * pct[1] / 100)           # 900
+    n_gripper = int(num_pts * pct[2] / 100)           # 50
+    n_table   = num_pts - n_rope - n_gripper           # 50  (last label takes rounding remainder)
+
+    assert pc.shape == (num_pts, 7), f"shape: expected ({num_pts}, 7), got {pc.shape}"
+    assert (pc[:, 6] == 1).sum() == n_rope,    f"rope:    expected {n_rope},    got {(pc[:, 6]==1).sum()}"
+    assert (pc[:, 6] == 2).sum() == n_gripper, f"gripper: expected {n_gripper}, got {(pc[:, 6]==2).sum()}"
+    assert (pc[:, 6] == 3).sum() == n_table,   f"table:   expected {n_table},   got {(pc[:, 6]==3).sum()}"
+    print(f"[PASS] stratified sampling  rope={n_rope}  gripper={n_gripper}  table={n_table}")
+
+    # None case → uniform linspace sampling; only shape is guaranteed
+    pc_none = RGBDData.get_pointcloud_from_arrays(
+        color_rgb, depth_m, camera_matrix, dist_coeffs,
+        label_map=label_map, num_pts=num_pts, label_percentages=None,
+    )
+    assert pc_none.shape == (num_pts, 7), f"None case shape: expected ({num_pts}, 7), got {pc_none.shape}"
+    counts_none = {lid: int((pc_none[:, 6] == lid).sum()) for lid in (1, 2, 3)}
+    print(f"[PASS] uniform sampling     label counts: {counts_none}")
+
+    # Upsample case: label 3 has only 5 raw pixels but is allocated 10% of pts
+    label_up_flat = np.array([1]*4995 + [2]*5000 + [3]*5, dtype=np.int32)
+    rng.shuffle(label_up_flat)
+    label_map_up = label_up_flat.reshape(H, W)
+
+    pct_up = {1: 80.0, 2: 10.0, 3: 10.0}
+    pc_up  = RGBDData.get_pointcloud_from_arrays(
+        color_rgb, depth_m, camera_matrix, dist_coeffs,
+        label_map=label_map_up, num_pts=num_pts, label_percentages=pct_up,
+    )
+
+    n3_expected = num_pts - int(num_pts * pct_up[1] / 100) - int(num_pts * pct_up[2] / 100)
+    assert pc_up.shape == (num_pts, 7), f"upsample shape: expected ({num_pts}, 7), got {pc_up.shape}"
+    assert (pc_up[:, 6] == 3).sum() == n3_expected, \
+        f"upsample label 3: expected {n3_expected}, got {(pc_up[:, 6]==3).sum()}"
+    print(f"[PASS] upsample guarantee   label 3 has 5 raw pts, allocated {n3_expected}")
+
+    print("\nAll label_percentages tests passed.")

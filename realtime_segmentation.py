@@ -12,7 +12,7 @@ Implements the architecture in realtime_segmentation_doc.md exactly:
 
 Label assignment (fixed):
     0  background
-    1  rope
+    1  blue pants
     2  orange gripper fingers
     3  table surface
 
@@ -38,8 +38,30 @@ Timing
 """
 
 import os
+import sys
 import tempfile
 import time
+import types
+
+# groundingdino imports transformers/huggingface_hub. When loaded from a mixed-venv
+# context (e.g. policy_runtime.py), the host venv's huggingface_hub may be a newer
+# version that breaks two things:
+#
+#   1. transformers runs a version check at import time that raises ImportError when
+#      it finds huggingface_hub>=1.0.  We bypass it by pre-registering an empty stub.
+#
+#   2. AutoTokenizer.from_pretrained("bert-base-uncased") calls list_repo_templates()
+#      via the 1.x hub API, which hits a 404 endpoint. We force offline mode so it
+#      uses the local ~/.cache/huggingface/hub cache instead (populated on first run).
+#      Using setdefault so callers can override by setting the env vars themselves.
+
+if "transformers.dependency_versions_check" not in sys.modules:
+    _stub = types.ModuleType("transformers.dependency_versions_check")
+    _stub.dep_version_check = lambda *a, **kw: None   # no-op; callers (deepspeed etc.) are safe
+    sys.modules["transformers.dependency_versions_check"] = _stub
+
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import groundingdino.datasets.transforms as GDT
 import numpy as np
@@ -48,24 +70,33 @@ from PIL import Image as PILImage
 
 import groundingdino
 from groundingdino.util.inference import load_model, predict as gdino_predict
+from groundingdino.util.inference import preprocess_caption
+from groundingdino.models.GroundingDINO.bertwarper import (
+    generate_masks_with_special_tokens_and_transfer_map,
+)
 
+
+# ── Target object ─────────────────────────────────────────────────────────
+# Change this one line to switch what the segmentor tracks as label 1.
+
+TARGET = "blue pants"
 
 # ── Class / label constants ────────────────────────────────────────────────
 
-CLASSES = ["rope", "orange gripper fingers", "table surface"]
+CLASSES = [TARGET, "orange gripper fingers", "table surface"]
 LABEL_IDS: dict[str, int] = {c: i + 1 for i, c in enumerate(CLASSES)}
-# rope → 1 · orange gripper fingers → 2 · table surface → 3
+# TARGET → 1 · orange gripper fingers → 2 · table surface → 3
 
-TEXT_PROMPT = "rope . orange gripper fingers . table surface"
+TEXT_PROMPT = f"{TARGET} . orange gripper fingers . table surface"
 
 _LABEL_COLORS = {
-    1: (0.95, 0.25, 0.25),   # rope                  — red
+    1: (0.95, 0.25, 0.25),   # TARGET                 — red
     2: (0.25, 0.95, 0.35),   # orange gripper fingers — green
     3: (0.25, 0.45, 1.00),   # table surface          — blue
 }
 _LABEL_NAMES = {
     0: "background",
-    1: "rope",
+    1: TARGET,
     2: "gripper",
     3: "table",
 }
@@ -76,7 +107,7 @@ _DEFAULT_GDINO_CFG = os.path.join(
     os.path.dirname(groundingdino.__file__),
     "config", "GroundingDINO_SwinT_OGC.py",
 )
-_DEFAULT_GDINO_CKPT = "groundingdino_swint_ogc.pth"
+_DEFAULT_GDINO_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "groundingdino_swint_ogc.pth")
 
 # Standard GDINO preprocessing transform (mirrors load_image internals)
 _GDINO_TRANSFORM = GDT.Compose([
@@ -88,7 +119,7 @@ _GDINO_TRANSFORM = GDT.Compose([
 # ── SAM 2 defaults ─────────────────────────────────────────────────────────
 
 _DEFAULT_SAM2_CFG  = "configs/sam2.1/sam2.1_hiera_t.yaml"
-_DEFAULT_SAM2_CKPT = "sam2.1_t.pt"
+_DEFAULT_SAM2_CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sam2.1_t.pt")
 
 
 class RealtimeSegmentation:
@@ -118,12 +149,21 @@ class RealtimeSegmentation:
         confidence_floor: float = 0.70,
         reprompt_every: int = 150,
         device: str | None = None,
+        gdino_resize: int = 480,
     ):
         self.box_threshold    = box_threshold
         self.text_threshold   = text_threshold
         self.confidence_floor = confidence_floor
         self.reprompt_every   = reprompt_every
         self.device           = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Build the image preprocessing transform for the requested resize.
+        # Default 480px (shorter side): 52ms/frame vs 90ms at 800px.
+        # For reference: 800px=90ms, 600px=66ms, 480px=52ms, 320px=48ms.
+        self._gdino_transform = GDT.Compose([
+            GDT.RandomResize([gdino_resize], max_size=int(gdino_resize * 1333 / 800)),
+            GDT.ToTensor(),
+            GDT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
 
         self._gdino_cfg  = gdino_cfg
         self._gdino_ckpt = gdino_ckpt
@@ -136,6 +176,7 @@ class RealtimeSegmentation:
         # Grounding DINO — loaded eagerly (small model, ~150 MB)
         self._detector = load_model(gdino_cfg, gdino_ckpt, device=self.device)
         self._detector.eval()
+        self._cache_bert_encoding()
 
         # Lazy-loaded SAM 2 predictors (loaded on first use)
         self._image_predictor = None   # SAM2ImagePredictor  (live mode)
@@ -154,6 +195,63 @@ class RealtimeSegmentation:
             "frame_total_ms": [],   # end-to-end per process_frame() call
         }
         self._chunk_sizes: list[int] = []
+
+    # ── BERT cache ────────────────────────────────────────────────────────────
+
+    def _cache_bert_encoding(self) -> None:
+        """Pre-compute and cache the BERT text encoding for the fixed prompt.
+
+        GroundingDINO re-encodes the caption on every forward() call even when
+        the prompt never changes (~70-80 ms of BERT inference wasted per frame).
+        We run BERT once here, then replace model.bert on this instance with a
+        thin nn.Module that returns the cached hidden state, saving ~70 ms/frame.
+        """
+        m = self._detector   # GroundingDINO model instance
+
+        # load_model() leaves the model on CPU; move it to the target device now
+        # so that bert weights and tokenized tensors are on the same device.
+        m.to(self.device)
+
+        caption = preprocess_caption(TEXT_PROMPT)
+        tokenized = m.tokenizer(
+            [caption], padding="longest", return_tensors="pt"
+        ).to(self.device)
+
+        text_self_attention_masks, position_ids, _ = \
+            generate_masks_with_special_tokens_and_transfer_map(
+                tokenized, m.specical_tokens, m.tokenizer
+            )
+
+        # sub_sentence_present=True (default): use modified attention mask
+        tokenized_for_encoder = {k: v for k, v in tokenized.items()
+                                  if k != "attention_mask"}
+        tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+        tokenized_for_encoder["position_ids"]   = position_ids
+
+        with torch.no_grad():
+            bert_output = m.bert(**tokenized_for_encoder)
+
+        # Store the hidden state as a registered buffer so it automatically
+        # moves to the correct device if the model is transferred later.
+        _hidden = bert_output.last_hidden_state.detach()
+
+        class _CachedBert(torch.nn.Module):
+            def __init__(self, hidden_state: torch.Tensor):
+                super().__init__()
+                self.register_buffer("_h", hidden_state)
+
+            def forward(self, **kwargs):
+                # Return an object supporting both attribute and subscript
+                # access — groundingdino uses bert_output["last_hidden_state"].
+                class _Out:
+                    def __init__(self, h):
+                        self.last_hidden_state = h
+                    def __getitem__(self, key):
+                        return getattr(self, key)
+                return _Out(self._h)
+
+        m.bert = _CachedBert(_hidden)
+        print("[GDINO] BERT encoding cached — text encoding will be skipped on future calls.")
 
     # ── Lazy SAM 2 loaders ─────────────────────────────────────────────────
 
@@ -203,7 +301,7 @@ class RealtimeSegmentation:
 
         # PIL image → normalised tensor (mirrors GDINO's load_image internals)
         pil_img = PILImage.fromarray(frame_rgb)
-        image_tensor, _ = _GDINO_TRANSFORM(pil_img, None)
+        image_tensor, _ = self._gdino_transform(pil_img, None)
         image_tensor = image_tensor.to(self.device)
 
         with torch.no_grad():
@@ -309,7 +407,7 @@ class RealtimeSegmentation:
         """
         H, W = frame_shape[:2]
         lm = np.zeros((H, W), dtype=np.int32)
-        for label in ["table surface", "orange gripper fingers", "rope"]:
+        for label in ["table surface", "orange gripper fingers", TARGET]:
             if label in masks_by_label:
                 lm[masks_by_label[label]] = LABEL_IDS[label]
         return lm
@@ -382,7 +480,7 @@ class RealtimeSegmentation:
             frame_rgb: (H, W, 3) uint8 RGB.
 
         Returns:
-            label_map : (H, W) int32 — 0 bg · 1 rope · 2 gripper · 3 table.
+            label_map : (H, W) int32 — 0 bg · 1 blue pants · 2 gripper · 3 table.
             scores    : {label: float} — SAM 2 IOU scores for detected objects.
         """
         t_frame = time.perf_counter()
@@ -634,7 +732,7 @@ if __name__ == "__main__":
 
     # ── Figure 1: per-object mask breakdown ────────────────────────────────
     # Layout: one row per selected frame, columns = [combined | rope | gripper | table]
-    COL_LABELS = ["combined", "rope", "gripper", "table"]
+    COL_LABELS = ["combined", TARGET, "gripper", "table"]
     COL_IDS    = [None, 1, 2, 3]
     n_rows, n_cols = len(shown), len(COL_LABELS)
 
@@ -680,7 +778,7 @@ if __name__ == "__main__":
 
     fig1.suptitle(
         "Segmentation: combined + per-object masks\n"
-        "(rope = red · gripper = green · table = blue)",
+        "(blue pants = red · gripper = green · table = blue)",
         fontsize=11,
     )
     plt.tight_layout()
