@@ -492,7 +492,12 @@ class Ext2Ego:
 
             if label_percentages is not None:
                 # Stratified sampling already done in get_pointcloud_from_arrays; no frustum cull.
-                pc_arrays[index] = np.concatenate([xyz_cam, pc[:, 3:]], axis=1)
+                merged = np.concatenate([xyz_cam, pc[:, 3:]], axis=1)
+                if merged.shape[1] == 6:
+                    merged = np.concatenate(
+                        [merged, np.zeros((len(merged), 1), dtype=np.float32)], axis=1
+                    )
+                pc_arrays[index] = merged
                 continue
 
             _, frustum_mask = self.filter_frustum(xyz_cam)
@@ -745,7 +750,7 @@ def main():
         )
     )
     print(f"{len(episodes)} episodes found")
-    seg = RealtimeSegmentation(reprompt_every=1)   # load GDINO + SAM 2 weights once for all episodes
+    seg = None #RealtimeSegmentation(reprompt_every=1)  # load GDINO + SAM 2 weights once for all episodes
     num_pts = 2048
     label_percentages = {1: 90.0, 2: 5.0, 3: 5.0}
     i = 1
@@ -753,7 +758,8 @@ def main():
     ego_fails = 0
     for episode in episodes:
         print(f"\n=== Processing {episode}: i = {i} ===")
-        seg.reset()
+        if seg is not None:
+            seg.reset()
         data     = RGBDData(episode)
         tracker  = ArucoTracker(data)
         pipeline = Ext2Ego(data, tracker, "config/camera.yaml", segmentation=seg)
@@ -763,9 +769,12 @@ def main():
             print(f"  SKIP: episode {i} cannot be processed for ext.")
         else:
             print(f"ret_ext shape: {ret_ext.shape}")
-            pipeline.save_processed_ext_seg(ret_ext)
-
-        seg.reset()
+            if seg is not None:
+                pipeline.save_processed_ext_seg(ret_ext)
+            else:
+                pipeline.save_processed_ext_no_seg(ret_ext)
+        if seg is not None:
+            seg.reset()
 
         ret_ego = pipeline.process_episode(num_pts, label_percentages)
         if ret_ego is None:
@@ -953,7 +962,7 @@ def create_video():
     )
     print(f"{len(episodes)} episodes found")
 
-    seg = RealtimeSegmentation(reprompt_every=1)
+    seg = RealtimeSegmentation(reprompt_every=10**9, confidence_floor=0.0)
     seg_palette = {1: [220, 50, 50], 2: [50, 220, 50], 3: [50, 100, 220]}
 
     for episode in episodes:
@@ -1000,6 +1009,6 @@ def create_video():
         print(f"Video saved: {out_path}")
 
 if __name__ == "__main__":
-    # main()
+    main()
     # step_by_step()
-    create_video()
+    # create_video()
