@@ -63,6 +63,7 @@ if "transformers.dependency_versions_check" not in sys.modules:
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
+import cv2
 import groundingdino.datasets.transforms as GDT
 import numpy as np
 import torch
@@ -79,7 +80,8 @@ from groundingdino.models.GroundingDINO.bertwarper import (
 # ── Target object ─────────────────────────────────────────────────────────
 # Change this one line to switch what the segmentor tracks as label 1.
 
-TARGET = "blue pants"
+# TARGET = "blue pants"
+TARGET = "rope"
 
 # ── Class / label constants ────────────────────────────────────────────────
 
@@ -150,12 +152,36 @@ class RealtimeSegmentation:
         reprompt_every: int = 150,
         device: str | None = None,
         gdino_resize: int = 480,
+        # ── Tracking health ────────────────────────────────────────────────────
+        area_ratio_max: float = 4.0,
+        area_ratio_min: float = 0.15,
+        area_min_px: int = 150,
+        centroid_jump_max_px: float = 80.0,
+        fill_drift_max: float = 0.25,
+        # ── Gripper contamination (universal: only gripper is orange) ──────────
+        orange_contamination_max: float = 0.08,
+        orange_hsv_lower: tuple = (5, 110, 70),
+        orange_hsv_upper: tuple = (28, 255, 255),
+        # ── Mask selection ─────────────────────────────────────────────────────
+        box_clip_pad: int = 12,
+        # ── Shape reference calibration ────────────────────────────────────────
+        ref_calibration_frames: int = 5,
     ):
-        self.box_threshold    = box_threshold
-        self.text_threshold   = text_threshold
-        self.confidence_floor = confidence_floor
-        self.reprompt_every   = reprompt_every
-        self.device           = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.box_threshold           = box_threshold
+        self.text_threshold          = text_threshold
+        self.confidence_floor        = confidence_floor
+        self.reprompt_every          = reprompt_every
+        self.device                  = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.area_ratio_max          = area_ratio_max
+        self.area_ratio_min          = area_ratio_min
+        self.area_min_px             = area_min_px
+        self.centroid_jump_max_px    = centroid_jump_max_px
+        self.fill_drift_max          = fill_drift_max
+        self.orange_contamination_max = orange_contamination_max
+        self.orange_hsv_lower        = np.array(orange_hsv_lower, dtype=np.uint8)
+        self.orange_hsv_upper        = np.array(orange_hsv_upper, dtype=np.uint8)
+        self.box_clip_pad            = box_clip_pad
+        self.ref_calibration_frames  = ref_calibration_frames
         # Build the image preprocessing transform for the requested resize.
         # Default 480px (shorter side): 52ms/frame vs 90ms at 800px.
         # For reference: 800px=90ms, 600px=66ms, 480px=52ms, 320px=48ms.
@@ -186,6 +212,23 @@ class RealtimeSegmentation:
         self._frame_idx: int = 0
         self._masks_by_label: dict[str, np.ndarray] = {}
         self._scores_by_label: dict[str, float]     = {}
+
+        # ── Hold / calibration state ───────────────────────────────────────────
+        # _last_good_masks covers ALL classes (TARGET, gripper, table), not just TARGET.
+        self._last_good_masks:  dict[str, np.ndarray] = {}
+        self._last_good_scores: dict[str, float]      = {}
+        self._prev_target_area:     int | None        = None
+        self._prev_target_centroid: np.ndarray | None = None
+        self._force_reprompt: bool = False
+
+        # Shape reference (auto-calibrated from first ref_calibration_frames)
+        self._ref_fill:   float | None = None
+        self._ref_area:   float | None = None
+        self._ref_aspect: float | None = None
+        self._calib_count:      int   = 0
+        self._calib_fill_sum:   float = 0.0
+        self._calib_area_sum:   float = 0.0
+        self._calib_aspect_sum: float = 0.0
 
         # Timing accumulators (ms)
         self.timing: dict[str, list[float]] = {
@@ -371,9 +414,12 @@ class RealtimeSegmentation:
     ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
         """Predict one mask per label using SAM 2 image predictor + box prompt.
 
-        Returns (masks_by_label, scores_by_label) where masks are (H, W) bool
-        and scores are SAM 2 IOU estimates in [0, 1].
-        Appends total time for all labels to self.timing["sam2_image_ms"].
+        For the TARGET class, requests all three SAM2 mask candidates and selects
+        the best via _select_target_mask (acceptance gates + shape-score ranking).
+        For all other classes, uses single-mask output as before.
+
+        Returns (masks_by_label, scores_by_label).
+        Appends total wall-time to self.timing["sam2_image_ms"].
         """
         predictor = self._get_image_predictor()
         t0 = time.perf_counter()
@@ -385,10 +431,19 @@ class RealtimeSegmentation:
         scores_out: dict[str, float]      = {}
 
         for label, box in boxes_by_label.items():
-            with torch.inference_mode():
-                masks, scores, _ = predictor.predict(box=box, multimask_output=False)
-            masks_out[label]  = masks[0].astype(bool)
-            scores_out[label] = float(scores[0])
+            if label == TARGET:
+                with torch.inference_mode():
+                    masks, scores, _ = predictor.predict(box=box, multimask_output=True)
+                best_mask, best_score = self._select_target_mask(
+                    frame_rgb, masks, scores, box
+                )
+                masks_out[label]  = best_mask
+                scores_out[label] = best_score
+            else:
+                with torch.inference_mode():
+                    masks, scores, _ = predictor.predict(box=box, multimask_output=False)
+                masks_out[label]  = masks[0].astype(bool)
+                scores_out[label] = float(scores[0])
 
         self.timing["sam2_image_ms"].append((time.perf_counter() - t0) * 1e3)
         return masks_out, scores_out
@@ -422,6 +477,103 @@ class RealtimeSegmentation:
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
         return np.array([cmin, rmin, cmax, rmax], dtype=np.float32)
+
+    # ── Tracking health helpers ────────────────────────────────────────────
+
+    def _mask_metrics(self, mask: np.ndarray) -> dict:
+        area = int(mask.sum())
+        if area == 0:
+            return {
+                "area": 0, "fill": 1.0, "aspect": 1.0,
+                "centroid": np.zeros(2, dtype=np.float32),
+            }
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        rmin, rmax = np.where(rows)[0][[0, -1]]
+        cmin, cmax = np.where(cols)[0][[0, -1]]
+        bbox_h = rmax - rmin + 1
+        bbox_w = cmax - cmin + 1
+        fill   = area / (bbox_h * bbox_w)
+        aspect = bbox_w / bbox_h if bbox_h > 0 else 1.0
+        ys, xs = np.where(mask)
+        centroid = np.array([xs.mean(), ys.mean()], dtype=np.float32)
+        return {"area": area, "fill": fill, "aspect": aspect, "centroid": centroid}
+
+    def _compute_orange_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+        return cv2.inRange(hsv, self.orange_hsv_lower, self.orange_hsv_upper).astype(bool)
+
+    def _update_calibration(self, metrics: dict) -> None:
+        if self._calib_count >= self.ref_calibration_frames:
+            return
+        self._calib_fill_sum   += metrics["fill"]
+        self._calib_area_sum   += metrics["area"]
+        self._calib_aspect_sum += metrics["aspect"]
+        self._calib_count += 1
+        if self._calib_count == self.ref_calibration_frames:
+            n = float(self._calib_count)
+            self._ref_fill   = self._calib_fill_sum   / n
+            self._ref_area   = self._calib_area_sum   / n
+            self._ref_aspect = self._calib_aspect_sum / n
+            print(
+                f"[seg] TARGET calibrated — "
+                f"fill={self._ref_fill:.3f}  area={self._ref_area:.0f}  "
+                f"aspect={self._ref_aspect:.2f}"
+            )
+
+    def _select_target_mask(
+        self,
+        frame_rgb: np.ndarray,
+        masks: np.ndarray,
+        scores: np.ndarray,
+        box: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        H, W = frame_rgb.shape[:2]
+        x0, y0, x1, y1 = box.astype(int)
+        pad = self.box_clip_pad
+        orange = self._compute_orange_mask(frame_rgb)
+
+        candidates = []
+        for mask_raw, score in zip(masks, scores):
+            mask = mask_raw.astype(bool)
+
+            # 1. Clip to box
+            clip = np.zeros((H, W), dtype=bool)
+            clip[
+                max(0, y0 - pad) : min(H, y1 + pad),
+                max(0, x0 - pad) : min(W, x1 + pad),
+            ] = True
+            mask = mask & clip
+            if not mask.any():
+                continue
+
+            metrics = self._mask_metrics(mask)
+
+            # 2. Orange contamination gate
+            if orange[mask].mean() > self.orange_contamination_max:
+                continue
+
+            # 3. Minimum area gate
+            if metrics["area"] < self.area_min_px:
+                continue
+
+            # 4. Fill gate (post-calibration only; slightly relaxed vs health-check)
+            if self._ref_fill is not None:
+                if abs(metrics["fill"] - self._ref_fill) > self.fill_drift_max + 0.1:
+                    continue
+
+            candidates.append((mask, float(score)))
+
+        if not candidates:
+            # All rejected — return raw best-IoU so health-check can hold
+            best_idx = int(np.argmax(scores))
+            return masks[best_idx].astype(bool), float(scores[best_idx])
+
+        # Rank by SAM2 IoU score — the model's own confidence is the best guide.
+        # Gates above handle rejection; do NOT override with area×(1−fill) scoring
+        # which causes large sparse table regions to outscore the actual thin object.
+        best = max(candidates, key=lambda c: c[1])
+        return best[0], best[1]
 
     # ── Timing helpers ─────────────────────────────────────────────────────
 
@@ -465,10 +617,24 @@ class RealtimeSegmentation:
     # ── Live / streaming mode ──────────────────────────────────────────────
 
     def reset(self) -> None:
-        """Reset streaming state.  Call before starting a new sequence."""
-        self._frame_idx       = 0
-        self._masks_by_label  = {}
-        self._scores_by_label = {}
+        """Reset streaming state. Call before starting a new sequence."""
+        self._frame_idx            = 0
+        self._masks_by_label       = {}
+        self._scores_by_label      = {}
+        # Hold state — covers all classes (TARGET, gripper, table)
+        self._last_good_masks      = {}
+        self._last_good_scores     = {}
+        self._prev_target_area     = None
+        self._prev_target_centroid = None
+        self._force_reprompt       = False
+        # Calibration state — reset so each episode auto-calibrates fresh
+        self._ref_fill             = None
+        self._ref_area             = None
+        self._ref_aspect           = None
+        self._calib_count          = 0
+        self._calib_fill_sum       = 0.0
+        self._calib_area_sum       = 0.0
+        self._calib_aspect_sum     = 0.0
 
     def process_frame(
         self,
@@ -480,22 +646,26 @@ class RealtimeSegmentation:
             frame_rgb: (H, W, 3) uint8 RGB.
 
         Returns:
-            label_map : (H, W) int32 — 0 bg · 1 blue pants · 2 gripper · 3 table.
+            label_map : (H, W) int32 — 0 bg · 1 TARGET · 2 gripper · 3 table.
             scores    : {label: float} — SAM 2 IOU scores for detected objects.
         """
         t_frame = time.perf_counter()
 
-        needs_reprompt = (
+        # ── Step 1: decide whether to run GDINO ─────────────────────────────
+        need_gdino = (
             self._frame_idx == 0
             or self._frame_idx % self.reprompt_every == 0
             or not self._masks_by_label
             or any(s < self.confidence_floor for s in self._scores_by_label.values())
+            or self._force_reprompt
         )
+        self._force_reprompt = False
+        gdino_ran = need_gdino
 
-        if needs_reprompt:
+        # ── Step 2: get boxes and run SAM2 ───────────────────────────────────
+        if need_gdino:
             boxes_by_label = self._detect_boxes(frame_rgb)
         else:
-            # Derive SAM 2 prompts from previous masks' bounding boxes
             boxes_by_label = {}
             for label, mask in self._masks_by_label.items():
                 box = self._mask_to_box(mask)
@@ -503,9 +673,155 @@ class RealtimeSegmentation:
                     boxes_by_label[label] = box
 
         if boxes_by_label:
-            self._masks_by_label, self._scores_by_label = self._sam2_predict_boxes(
-                frame_rgb, boxes_by_label
+            new_masks, new_scores = self._sam2_predict_boxes(frame_rgb, boxes_by_label)
+        else:
+            new_masks, new_scores = {}, {}
+
+        # ── Step 3: health-check TARGET mask ────────────────────────────────
+        if TARGET in new_masks:
+            mask    = new_masks[TARGET]
+            metrics = self._mask_metrics(mask)
+            orange  = self._compute_orange_mask(frame_rgb)
+
+            contaminated = bool(orange[mask].mean() > self.orange_contamination_max) \
+                           if mask.any() else False
+
+            fill_drifted = (
+                self._ref_fill is not None
+                and abs(metrics["fill"] - self._ref_fill) > self.fill_drift_max
             )
+
+            area_ok = metrics["area"] >= self.area_min_px
+
+            if self._prev_target_area is not None:
+                ratio = metrics["area"] / (self._prev_target_area + 1)
+                area_ratio_ok = self.area_ratio_min <= ratio <= self.area_ratio_max
+            else:
+                area_ratio_ok = True
+
+            if self._prev_target_centroid is not None:
+                jump = float(np.linalg.norm(metrics["centroid"] - self._prev_target_centroid))
+                jump_ok = jump <= self.centroid_jump_max_px
+            else:
+                jump_ok = True
+
+            # ── Step 4: decide action ────────────────────────────────────────
+            if contaminated or fill_drifted:
+                if not gdino_ran:
+                    gdino_boxes = self._detect_boxes(frame_rgb)
+                    gdino_ran = True
+                    if gdino_boxes:
+                        new_masks, new_scores = self._sam2_predict_boxes(
+                            frame_rgb, gdino_boxes
+                        )
+                        if TARGET in new_masks:
+                            mask2    = new_masks[TARGET]
+                            metrics2 = self._mask_metrics(mask2)
+                            orange2  = bool(orange[mask2].mean() > self.orange_contamination_max) \
+                                       if mask2.any() else False
+                            fill_d2  = (
+                                self._ref_fill is not None
+                                and abs(metrics2["fill"] - self._ref_fill) > self.fill_drift_max
+                            )
+                            if not orange2 and not fill_d2 and metrics2["area"] >= self.area_min_px:
+                                metrics       = metrics2
+                                area_ok       = True
+                                area_ratio_ok = True
+                                jump_ok       = True
+                                contaminated  = False
+                                fill_drifted  = False
+                            else:
+                                self._force_reprompt = True
+                                contaminated = True
+
+            if contaminated or fill_drifted:
+                action = "hold"
+            elif not area_ok or not area_ratio_ok or not jump_ok:
+                action = "hold"
+            else:
+                action = "accept"
+        else:
+            action = "accept"
+            metrics = None
+
+        # ── Step 5: apply TARGET action; update last_good for all classes ────
+        if action == "hold" and TARGET in self._last_good_masks:
+            new_masks[TARGET]  = self._last_good_masks[TARGET]
+            new_scores[TARGET] = self._last_good_scores.get(TARGET, 0.0)
+        elif action == "accept" and TARGET in new_masks and metrics is not None:
+            # Only update last_good when the mask is genuinely above the quality floor.
+            # This prevents gradual erosion from poisoning the hold fallback: degraded
+            # masks may pass the per-frame area_ratio check but must not become the
+            # new reference that hold would restore.
+            if metrics["area"] >= self.area_min_px:
+                self._last_good_masks[TARGET]  = new_masks[TARGET]
+                self._last_good_scores[TARGET] = new_scores.get(TARGET, 0.0)
+            self._prev_target_area     = metrics["area"]
+            self._prev_target_centroid = metrics["centroid"].copy()
+            self._update_calibration(metrics)
+
+        # Update last_good for non-TARGET classes whenever they produce a non-empty mask.
+        for label in CLASSES:
+            if label == TARGET:
+                continue
+            if label in new_masks and new_masks[label].any():
+                self._last_good_masks[label]  = new_masks[label]
+                self._last_good_scores[label] = new_scores.get(label, 0.0)
+
+        # ── Step 6: ensure all labels are present and above quality floor ────
+        # TARGET is treated as missing when its area is below area_min_px, not only
+        # when the mask is completely empty. This catches gradual erosion (non-zero
+        # but degraded) and triggers GDINO re-acquisition while the object is still
+        # fully visible. Gripper and table use the simpler non-empty check only.
+        missing = [
+            label for label in CLASSES
+            if label not in new_masks
+            or not new_masks[label].any()
+            or (label == TARGET and new_masks[label].sum() < self.area_min_px)
+        ]
+        if missing:
+            if not gdino_ran:
+                recovery_boxes = self._detect_boxes(frame_rgb)
+                gdino_ran = True  # noqa: F841
+                if recovery_boxes:
+                    recovery_masks, recovery_scores = self._sam2_predict_boxes(
+                        frame_rgb, recovery_boxes
+                    )
+                    orange_mask = self._compute_orange_mask(frame_rgb)
+                    for label in list(missing):
+                        if label not in recovery_masks or not recovery_masks[label].any():
+                            continue
+                        if label == TARGET:
+                            rmask = recovery_masks[label]
+                            if rmask.any() and orange_mask[rmask].mean() <= self.orange_contamination_max:
+                                new_masks[label]  = rmask
+                                new_scores[label] = recovery_scores[label]
+                                if rmask.sum() >= self.area_min_px:
+                                    self._last_good_masks[label]  = rmask
+                                    self._last_good_scores[label] = recovery_scores[label]
+                                rmetrics = self._mask_metrics(rmask)
+                                self._prev_target_area     = rmetrics["area"]
+                                self._prev_target_centroid = rmetrics["centroid"].copy()
+                                self._update_calibration(rmetrics)
+                                missing.remove(label)
+                        else:
+                            new_masks[label]  = recovery_masks[label]
+                            new_scores[label] = recovery_scores[label]
+                            self._last_good_masks[label]  = recovery_masks[label]
+                            self._last_good_scores[label] = recovery_scores[label]
+                            missing.remove(label)
+
+            # Still missing: use last_good if available, else force GDINO next frame.
+            for label in missing:
+                if label in self._last_good_masks:
+                    new_masks[label]  = self._last_good_masks[label]
+                    new_scores[label] = self._last_good_scores.get(label, 0.0)
+                else:
+                    self._force_reprompt = True
+
+        # Commit for next frame's box derivation
+        self._masks_by_label  = new_masks
+        self._scores_by_label = new_scores
 
         self._frame_idx += 1
         self.timing["frame_total_ms"].append((time.perf_counter() - t_frame) * 1e3)

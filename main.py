@@ -962,12 +962,12 @@ def create_video():
     )
     print(f"{len(episodes)} episodes found")
 
-    seg = RealtimeSegmentation(reprompt_every=10**9, confidence_floor=0.0)
     seg_palette = {1: [220, 50, 50], 2: [50, 220, 50], 3: [50, 100, 220]}
 
     for episode in episodes:
         print(f"\nCreating video for: {episode}")
-        seg.reset()
+        # seg.reset()
+        seg = RealtimeSegmentation()
         data = RGBDData(episode)
 
         N   = data.num_frames
@@ -1009,6 +1009,6 @@ def create_video():
         print(f"Video saved: {out_path}")
 
 if __name__ == "__main__":
-    main()
+    # main()
     # step_by_step()
-    # create_video()
+    create_video()
