@@ -166,6 +166,12 @@ class RealtimeSegmentation:
         box_clip_pad: int = 12,
         # ── Shape reference calibration ────────────────────────────────────────
         ref_calibration_frames: int = 5,
+        # ── Table containment (scene guarantee: TARGET rests on the table) ─────
+        table_containment_min: float = 0.60,
+        table_close_px: int = 31,
+        table_erode_frac: float = 0.06,
+        # ── Debug ────────────────────────────────────────────────────────────────
+        debug: bool = False,
     ):
         self.box_threshold           = box_threshold
         self.text_threshold          = text_threshold
@@ -182,6 +188,10 @@ class RealtimeSegmentation:
         self.orange_hsv_upper        = np.array(orange_hsv_upper, dtype=np.uint8)
         self.box_clip_pad            = box_clip_pad
         self.ref_calibration_frames  = ref_calibration_frames
+        self.table_containment_min   = table_containment_min
+        self.table_close_px          = table_close_px
+        self.table_erode_frac        = table_erode_frac
+        self.debug                   = debug
         # Build the image preprocessing transform for the requested resize.
         # Default 480px (shorter side): 52ms/frame vs 90ms at 800px.
         # For reference: 800px=90ms, 600px=66ms, 480px=52ms, 320px=48ms.
@@ -414,12 +424,10 @@ class RealtimeSegmentation:
     ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
         """Predict one mask per label using SAM 2 image predictor + box prompt.
 
-        For the TARGET class, requests all three SAM2 mask candidates and selects
-        the best via _select_target_mask (acceptance gates + shape-score ranking).
-        For all other classes, uses single-mask output as before.
-
-        Returns (masks_by_label, scores_by_label).
-        Appends total wall-time to self.timing["sam2_image_ms"].
+        Non-TARGET labels are processed first so the freshly predicted table mask
+        is available for the TARGET containment gate. TARGET uses
+        multimask_output=True routed through _select_target_mask; other classes
+        use single-mask output.
         """
         predictor = self._get_image_predictor()
         t0 = time.perf_counter()
@@ -430,12 +438,18 @@ class RealtimeSegmentation:
         masks_out:  dict[str, np.ndarray] = {}
         scores_out: dict[str, float]      = {}
 
-        for label, box in boxes_by_label.items():
+        # TARGET last — its containment gate needs the table mask
+        ordered = sorted(boxes_by_label.items(), key=lambda kv: kv[0] == TARGET)
+
+        for label, box in ordered:
             if label == TARGET:
                 with torch.inference_mode():
                     masks, scores, _ = predictor.predict(box=box, multimask_output=True)
+                table_mask = masks_out.get(
+                    "table surface", self._last_good_masks.get("table surface")
+                )
                 best_mask, best_score = self._select_target_mask(
-                    frame_rgb, masks, scores, box
+                    frame_rgb, masks, scores, box, table_mask=table_mask
                 )
                 masks_out[label]  = best_mask
                 scores_out[label] = best_score
@@ -521,20 +535,55 @@ class RealtimeSegmentation:
                 f"aspect={self._ref_aspect:.2f}"
             )
 
+    def _table_interior(self, table_mask: np.ndarray | None) -> np.ndarray | None:
+        """Compute the table-interior region used for the TARGET containment gate.
+
+        Pipeline:
+          1. Morphological close with a table_close_px kernel — fills the thin
+             hole that the TARGET itself punches in the table mask.
+          2. Erode by table_erode_frac × (table bbox min side) — removes the
+             boundary band where the robot's cables and off-table clutter live.
+
+        Returns (H, W) bool, or None when no usable table mask is available
+        (gate is skipped — never block on a missing table).
+        """
+        if table_mask is None or not table_mask.any():
+            return None
+        m = table_mask.astype(np.uint8)
+        k = max(3, self.table_close_px | 1)   # force odd, >= 3
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_kernel)
+
+        rows = np.any(closed, axis=1)
+        cols = np.any(closed, axis=0)
+        if not rows.any():
+            return None
+        rmin, rmax = np.where(rows)[0][[0, -1]]
+        cmin, cmax = np.where(cols)[0][[0, -1]]
+        min_side = max(1, min(rmax - rmin + 1, cmax - cmin + 1))
+        e = max(1, int(min_side * self.table_erode_frac))
+        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e + 1, 2 * e + 1))
+        interior = cv2.erode(closed, erode_kernel)
+        if not interior.any():
+            return None
+        return interior.astype(bool)
+
     def _select_target_mask(
         self,
         frame_rgb: np.ndarray,
         masks: np.ndarray,
         scores: np.ndarray,
         box: np.ndarray,
+        table_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, float]:
         H, W = frame_rgb.shape[:2]
         x0, y0, x1, y1 = box.astype(int)
         pad = self.box_clip_pad
         orange = self._compute_orange_mask(frame_rgb)
+        interior = self._table_interior(table_mask)
 
         candidates = []
-        for mask_raw, score in zip(masks, scores):
+        for ci, (mask_raw, score) in enumerate(zip(masks, scores)):
             mask = mask_raw.astype(bool)
 
             # 1. Clip to box
@@ -551,27 +600,44 @@ class RealtimeSegmentation:
 
             # 2. Orange contamination gate
             if orange[mask].mean() > self.orange_contamination_max:
+                if self.debug:
+                    print(f"[seg][f{self._frame_idx}] cand{ci} rejected: orange "
+                          f"({orange[mask].mean():.2f})")
                 continue
 
             # 3. Minimum area gate
             if metrics["area"] < self.area_min_px:
+                if self.debug:
+                    print(f"[seg][f{self._frame_idx}] cand{ci} rejected: area "
+                          f"({metrics['area']})")
                 continue
 
             # 4. Fill gate (post-calibration only; slightly relaxed vs health-check)
             if self._ref_fill is not None:
                 if abs(metrics["fill"] - self._ref_fill) > self.fill_drift_max + 0.1:
+                    if self.debug:
+                        print(f"[seg][f{self._frame_idx}] cand{ci} rejected: fill "
+                              f"({metrics['fill']:.2f} vs ref {self._ref_fill:.2f})")
+                    continue
+
+            # 5. Table containment gate (scene guarantee)
+            if interior is not None:
+                containment = interior[mask].mean()
+                if containment < self.table_containment_min:
+                    if self.debug:
+                        print(f"[seg][f{self._frame_idx}] cand{ci} rejected: off-table "
+                              f"(containment {containment:.2f})")
                     continue
 
             candidates.append((mask, float(score)))
 
         if not candidates:
-            # All rejected — return raw best-IoU so health-check can hold
+            # All rejected — return raw best-IoU; process_frame re-applies the
+            # orange and table gates so this can never be silently accepted.
             best_idx = int(np.argmax(scores))
             return masks[best_idx].astype(bool), float(scores[best_idx])
 
-        # Rank by SAM2 IoU score — the model's own confidence is the best guide.
-        # Gates above handle rejection; do NOT override with area×(1−fill) scoring
-        # which causes large sparse table regions to outscore the actual thin object.
+        # Rank by SAM2 IoU score — gates reject; IoU ranks. Never rank by area or fill.
         best = max(candidates, key=lambda c: c[1])
         return best[0], best[1]
 
@@ -642,9 +708,6 @@ class RealtimeSegmentation:
     ) -> tuple[np.ndarray, dict[str, float]]:
         """Process one frame for live / streaming use.
 
-        Args:
-            frame_rgb: (H, W, 3) uint8 RGB.
-
         Returns:
             label_map : (H, W) int32 — 0 bg · 1 TARGET · 2 gripper · 3 table.
             scores    : {label: float} — SAM 2 IOU scores for detected objects.
@@ -665,6 +728,9 @@ class RealtimeSegmentation:
         # ── Step 2: get boxes and run SAM2 ───────────────────────────────────
         if need_gdino:
             boxes_by_label = self._detect_boxes(frame_rgb)
+            if self.debug:
+                print(f"[seg][f{self._frame_idx}] GDINO boxes: "
+                      f"{sorted(boxes_by_label.keys())}")
         else:
             boxes_by_label = {}
             for label, mask in self._masks_by_label.items():
@@ -686,6 +752,18 @@ class RealtimeSegmentation:
             contaminated = bool(orange[mask].mean() > self.orange_contamination_max) \
                            if mask.any() else False
 
+            # Re-apply the table containment gate so the all-rejected fallback
+            # from _select_target_mask can never be silently accepted.
+            table_now = new_masks.get(
+                "table surface", self._last_good_masks.get("table surface")
+            )
+            interior = self._table_interior(table_now)
+            off_table = bool(
+                interior is not None
+                and mask.any()
+                and interior[mask].mean() < self.table_containment_min
+            )
+
             fill_drifted = (
                 self._ref_fill is not None
                 and abs(metrics["fill"] - self._ref_fill) > self.fill_drift_max
@@ -706,7 +784,7 @@ class RealtimeSegmentation:
                 jump_ok = True
 
             # ── Step 4: decide action ────────────────────────────────────────
-            if contaminated or fill_drifted:
+            if contaminated or off_table or fill_drifted:
                 if not gdino_ran:
                     gdino_boxes = self._detect_boxes(frame_rgb)
                     gdino_ran = True
@@ -719,40 +797,55 @@ class RealtimeSegmentation:
                             metrics2 = self._mask_metrics(mask2)
                             orange2  = bool(orange[mask2].mean() > self.orange_contamination_max) \
                                        if mask2.any() else False
-                            fill_d2  = (
+                            table2 = new_masks.get(
+                                "table surface", self._last_good_masks.get("table surface")
+                            )
+                            interior2 = self._table_interior(table2)
+                            off2 = bool(
+                                interior2 is not None
+                                and mask2.any()
+                                and interior2[mask2].mean() < self.table_containment_min
+                            )
+                            fill_d2 = (
                                 self._ref_fill is not None
                                 and abs(metrics2["fill"] - self._ref_fill) > self.fill_drift_max
                             )
-                            if not orange2 and not fill_d2 and metrics2["area"] >= self.area_min_px:
+                            if not orange2 and not off2 and not fill_d2 \
+                                    and metrics2["area"] >= self.area_min_px:
                                 metrics       = metrics2
                                 area_ok       = True
                                 area_ratio_ok = True
                                 jump_ok       = True
                                 contaminated  = False
+                                off_table     = False
                                 fill_drifted  = False
                             else:
                                 self._force_reprompt = True
                                 contaminated = True
 
-            if contaminated or fill_drifted:
+            if contaminated or off_table or fill_drifted:
                 action = "hold"
             elif not area_ok or not area_ratio_ok or not jump_ok:
                 action = "hold"
             else:
                 action = "accept"
+
+            if self.debug:
+                print(f"[seg][f{self._frame_idx}] TARGET action={action} "
+                      f"area={metrics['area']} orange={contaminated} "
+                      f"off_table={off_table} fill_drift={fill_drifted}")
         else:
             action = "accept"
             metrics = None
+            if self.debug and gdino_ran:
+                print(f"[seg][f{self._frame_idx}] TARGET not detected by GDINO")
 
         # ── Step 5: apply TARGET action; update last_good for all classes ────
         if action == "hold" and TARGET in self._last_good_masks:
             new_masks[TARGET]  = self._last_good_masks[TARGET]
             new_scores[TARGET] = self._last_good_scores.get(TARGET, 0.0)
         elif action == "accept" and TARGET in new_masks and metrics is not None:
-            # Only update last_good when the mask is genuinely above the quality floor.
-            # This prevents gradual erosion from poisoning the hold fallback: degraded
-            # masks may pass the per-frame area_ratio check but must not become the
-            # new reference that hold would restore.
+            # Quality-gated last_good update (prevents erosion poisoning)
             if metrics["area"] >= self.area_min_px:
                 self._last_good_masks[TARGET]  = new_masks[TARGET]
                 self._last_good_scores[TARGET] = new_scores.get(TARGET, 0.0)
@@ -760,7 +853,6 @@ class RealtimeSegmentation:
             self._prev_target_centroid = metrics["centroid"].copy()
             self._update_calibration(metrics)
 
-        # Update last_good for non-TARGET classes whenever they produce a non-empty mask.
         for label in CLASSES:
             if label == TARGET:
                 continue
@@ -769,10 +861,6 @@ class RealtimeSegmentation:
                 self._last_good_scores[label] = new_scores.get(label, 0.0)
 
         # ── Step 6: ensure all labels are present and above quality floor ────
-        # TARGET is treated as missing when its area is below area_min_px, not only
-        # when the mask is completely empty. This catches gradual erosion (non-zero
-        # but degraded) and triggers GDINO re-acquisition while the object is still
-        # fully visible. Gripper and table use the simpler non-empty check only.
         missing = [
             label for label in CLASSES
             if label not in new_masks
@@ -793,7 +881,18 @@ class RealtimeSegmentation:
                             continue
                         if label == TARGET:
                             rmask = recovery_masks[label]
-                            if rmask.any() and orange_mask[rmask].mean() <= self.orange_contamination_max:
+                            # Recovered TARGET must pass orange AND table gates
+                            rtable = recovery_masks.get(
+                                "table surface", self._last_good_masks.get("table surface")
+                            )
+                            rinterior = self._table_interior(rtable)
+                            on_table = (
+                                rinterior is None
+                                or rinterior[rmask].mean() >= self.table_containment_min
+                            )
+                            if rmask.any() \
+                                    and orange_mask[rmask].mean() <= self.orange_contamination_max \
+                                    and on_table:
                                 new_masks[label]  = rmask
                                 new_scores[label] = recovery_scores[label]
                                 if rmask.sum() >= self.area_min_px:

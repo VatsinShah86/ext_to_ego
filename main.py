@@ -967,7 +967,7 @@ def create_video():
     for episode in episodes:
         print(f"\nCreating video for: {episode}")
         # seg.reset()
-        seg = RealtimeSegmentation()
+        seg = RealtimeSegmentation(debug=True)
         data = RGBDData(episode)
 
         N   = data.num_frames
