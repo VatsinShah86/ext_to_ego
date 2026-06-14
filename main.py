@@ -750,7 +750,7 @@ def main():
         )
     )
     print(f"{len(episodes)} episodes found")
-    seg = None #RealtimeSegmentation(reprompt_every=1)  # load GDINO + SAM 2 weights once for all episodes
+    seg = RealtimeSegmentation()  # load GDINO + SAM 2 weights once for all episodes
     num_pts = 2048
     label_percentages = {1: 90.0, 2: 5.0, 3: 5.0}
     i = 1
@@ -964,6 +964,9 @@ def create_video():
 
     seg_palette = {1: [220, 50, 50], 2: [50, 220, 50], 3: [50, 100, 220]}
 
+    # Accumulators for cross-episode summary
+    all_stats = []   # list of dicts, one per episode
+
     for episode in episodes:
         print(f"\nCreating video for: {episode}")
         # seg.reset()
@@ -981,9 +984,15 @@ def create_video():
             out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W * 2, H)
         )
 
+        missing_frames = []
+
         for i in range(N):
             color_rgb, _ = data.get_frame(i)
             label_map, _ = seg.process_frame(color_rgb)
+
+            target_present = bool((label_map == 1).any())
+            if not target_present:
+                missing_frames.append(i)
 
             seg_vis = np.zeros((H, W, 3), dtype=np.uint8)
             for lid, col in seg_palette.items():
@@ -1000,6 +1009,12 @@ def create_video():
                 cv2.putText(img, timestamp_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,   0,   0  ), 3, cv2.LINE_AA)
                 cv2.putText(img, timestamp_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
+            if not target_present:
+                cv2.putText(bgr_seg, "TARGET MISSING", (10, H - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0),       3, cv2.LINE_AA)
+                cv2.putText(bgr_seg, "TARGET MISSING", (10, H - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 80, 255),    1, cv2.LINE_AA)
+
             writer.write(np.concatenate([bgr_rgb, bgr_seg], axis=1))
 
             if i % 20 == 0:
@@ -1008,7 +1023,68 @@ def create_video():
         writer.release()
         print(f"Video saved: {out_path}")
 
+        # ── Missing-TARGET summary ────────────────────────────────────────────
+        n_miss = len(missing_frames)
+        pct    = 100.0 * n_miss / N if N > 0 else 0.0
+        t1, t2 = N // 3, 2 * N // 3
+        beg    = sum(1 for f in missing_frames if f <  t1)
+        mid    = sum(1 for f in missing_frames if t1 <= f < t2)
+        end    = sum(1 for f in missing_frames if f >= t2)
+        print(f"  TARGET missing: {n_miss}/{N} frames ({pct:.1f}%)")
+        print(f"    beginning (0–{t1-1}):   {beg} frames")
+        print(f"    middle   ({t1}–{t2-1}): {mid} frames")
+        print(f"    end      ({t2}–{N-1}):  {end} frames")
+        if missing_frames:
+            runs, run_start = [], missing_frames[0]
+            prev = missing_frames[0]
+            for f in missing_frames[1:]:
+                if f != prev + 1:
+                    runs.append((run_start, prev))
+                    run_start = f
+                prev = f
+            runs.append((run_start, prev))
+            run_str = ", ".join(
+                str(a) if a == b else f"{a}-{b}" for a, b in runs[:10]
+            )
+            if len(runs) > 10:
+                run_str += f" … ({len(runs)} runs total)"
+            print(f"    missing runs: {run_str}")
+
+        all_stats.append({"ep": ep_name, "N": N, "miss": n_miss, "beg": beg, "mid": mid, "end": end})
+
+    # ── Cross-episode overall summary ─────────────────────────────────────────
+    total_frames   = sum(s["N"]    for s in all_stats)
+    total_miss     = sum(s["miss"] for s in all_stats)
+    total_beg      = sum(s["beg"]  for s in all_stats)
+    total_mid      = sum(s["mid"]  for s in all_stats)
+    total_end      = sum(s["end"]  for s in all_stats)
+    n_ep           = len(all_stats)
+    n_ep_any_miss  = sum(1 for s in all_stats if s["miss"] > 0)
+    pct_miss       = 100.0 * total_miss / total_frames if total_frames > 0 else 0.0
+
+    print("\n" + "=" * 60)
+    print("OVERALL MISSING-TARGET SUMMARY")
+    print("=" * 60)
+    print(f"  Episodes          : {n_ep}")
+    print(f"  Total frames      : {total_frames}")
+    print(f"  Total missing     : {total_miss}  ({pct_miss:.2f}%)")
+    print(f"  Episodes with miss: {n_ep_any_miss}/{n_ep}")
+    print(f"  Missing by section:")
+    print(f"    beginning (1st third): {total_beg}  ({100.*total_beg/total_miss:.1f}%)" if total_miss else "    beginning: 0")
+    print(f"    middle    (2nd third): {total_mid}  ({100.*total_mid/total_miss:.1f}%)" if total_miss else "    middle:    0")
+    print(f"    end       (3rd third): {total_end}  ({100.*total_end/total_miss:.1f}%)" if total_miss else "    end:       0")
+
+    if n_ep_any_miss:
+        print(f"  Episodes with missing frames:")
+        for s in all_stats:
+            if s["miss"] == 0:
+                continue
+            pct_ep = 100.0 * s["miss"] / s["N"]
+            print(f"    {s['ep']:45s}  {s['miss']:4d}/{s['N']}  ({pct_ep:.1f}%)  "
+                  f"beg={s['beg']} mid={s['mid']} end={s['end']}")
+    print("=" * 60)
+
 if __name__ == "__main__":
-    # main()
+    main()
     # step_by_step()
-    create_video()
+    # create_video()

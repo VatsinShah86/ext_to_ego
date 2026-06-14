@@ -80,8 +80,8 @@ from groundingdino.models.GroundingDINO.bertwarper import (
 # ── Target object ─────────────────────────────────────────────────────────
 # Change this one line to switch what the segmentor tracks as label 1.
 
-# TARGET = "blue pants"
-TARGET = "rope"
+TARGET = "blue pants"
+# TARGET = "brown rope"
 
 # ── Class / label constants ────────────────────────────────────────────────
 
@@ -147,7 +147,7 @@ class RealtimeSegmentation:
         sam2_cfg: str = _DEFAULT_SAM2_CFG,
         sam2_ckpt: str = _DEFAULT_SAM2_CKPT,
         box_threshold: float = 0.35,
-        text_threshold: float = 0.25,
+        text_threshold: float = 0.15,
         confidence_floor: float = 0.70,
         reprompt_every: int = 150,
         device: str | None = None,
@@ -438,8 +438,13 @@ class RealtimeSegmentation:
         masks_out:  dict[str, np.ndarray] = {}
         scores_out: dict[str, float]      = {}
 
-        # TARGET last — its containment gate needs the table mask
-        ordered = sorted(boxes_by_label.items(), key=lambda kv: kv[0] == TARGET)
+        # Process in CLASSES order: TARGET first, gripper second, table last.
+        # The containment gate falls back to _last_good_masks["table surface"]
+        # when no fresh table mask exists yet (skipped only at frame 0).
+        ordered = sorted(
+            boxes_by_label.items(),
+            key=lambda kv: CLASSES.index(kv[0]) if kv[0] in CLASSES else len(CLASSES),
+        )
 
         for label, box in ordered:
             if label == TARGET:
